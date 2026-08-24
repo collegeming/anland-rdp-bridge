@@ -273,6 +273,18 @@ impl SessionRunner {
             let _ = wire::write_frame(&mut stream, t, &p).await;
         }
 
+        // 3b. Reconnect replay: the latest still-unacknowledged `mstsc`
+        // clipboard update (Android may have missed it before disconnecting).
+        // Same guard-drops-before-await pattern to stay Send.
+        let pending = match self.pending_clipboard.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => None,
+        };
+        if let Some((seq, text)) = pending {
+            let cu = ClipboardUpdate { sequence: seq, text };
+            let _ = wire::write_frame(&mut stream, msg::CLIPBOARD_UPDATE, &cu.encode()).await;
+        }
+
         // 4. Run the read + write loop until disconnect or shutdown. Clone
         // the shared handles into locals so the loop body borrows `self` only
         // via `outbound` (the `&mut self.outbound_rx` field borrow); the
