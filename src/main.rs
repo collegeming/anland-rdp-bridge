@@ -34,6 +34,8 @@ mod keyboard_layout;
 mod logging;
 mod multitransport;
 #[cfg(not(target_os = "macos"))]
+mod anland_bridge;
+#[cfg(not(target_os = "macos"))]
 mod platform;
 mod rdpdr;
 mod reaper;
