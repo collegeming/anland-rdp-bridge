@@ -11,7 +11,7 @@
 //! `frame_length - 1`. `frame_length` must be 1–16 MiB inclusive. Unless
 //! stated otherwise, numeric payload fields are little-endian.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Maximum frame length: 16 MiB.
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn video_frame_rejects_empty_nal() {
-        let mut p = vec![0u8; VideoFramePayload::HEADER_LEN];
+        let p = vec![0u8; VideoFramePayload::HEADER_LEN];
         assert!(VideoFramePayload::decode(&p).is_err());
     }
 
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn clipboard_rejects_zero_sequence() {
-        let mut p = vec![0u8; 9];
+        let p = vec![0u8; 9];
         assert!(ClipboardUpdate::decode(&p).is_err());
     }
 

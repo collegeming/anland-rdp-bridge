@@ -38,7 +38,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
@@ -70,7 +70,7 @@ const TAG_LEN: usize = 32;
 pub fn session_key(token: &[u8]) -> [u8; TAG_LEN] {
     let mut mac = HmacSha256::new_from_slice(token).expect("HMAC accepts any key length");
     mac.update(KDF_CONTEXT);
-    finalize_tag(&mut mac)
+    finalize_tag(mac)
 }
 
 /// Build the transcript: `MAGIC || version || android_nonce || rust_nonce`.
@@ -92,7 +92,7 @@ pub fn server_proof(
     let mut mac = HmacSha256::new_from_slice(session_key).expect("HMAC accepts any key length");
     mac.update(SERVER_CONTEXT);
     mac.update(&transcript(android_nonce, rust_nonce));
-    finalize_tag(&mut mac)
+    finalize_tag(mac)
 }
 
 /// Client proof: `HMAC-SHA256(session_key, CLIENT_CONTEXT || transcript)`.
@@ -104,7 +104,7 @@ pub fn client_proof(
     let mut mac = HmacSha256::new_from_slice(session_key).expect("HMAC accepts any key length");
     mac.update(CLIENT_CONTEXT);
     mac.update(&transcript(android_nonce, rust_nonce));
-    finalize_tag(&mut mac)
+    finalize_tag(mac)
 }
 
 /// Verify a received client proof in constant time. Returns `Err` on mismatch.
@@ -206,13 +206,14 @@ where
     Ok(VERSION)
 }
 
-/// Finalize an HMAC into a fixed-length tag. Uses `finalize_reset` (which
-/// borrows) so callers that hold `&mut HmacSha256` can finalize without
-/// giving up ownership.
-fn finalize_tag(mac: &mut HmacSha256) -> [u8; TAG_LEN] {
-    let bytes = mac.finalize_reset().into_bytes();
+/// Finalize an HMAC into a fixed-length tag. Consumes the `Mac` (one-shot
+/// `finalize`); `Hmac` does not implement `FixedOutputReset`, so the reset
+/// variant is unavailable — but each proof builds a fresh `Mac` and finalizes
+/// once, so consuming is correct here.
+fn finalize_tag(mac: HmacSha256) -> [u8; TAG_LEN] {
+    let bytes = mac.finalize();
     let mut out = [0u8; TAG_LEN];
-    out.copy_from_slice(&bytes);
+    out.copy_from_slice(bytes.as_bytes());
     out
 }
 
