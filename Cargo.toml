@@ -1,13 +1,14 @@
 [package]
-name = "macrdp"
-version = "0.9.6"
+name = "anland_rdp_bridge"
+version = "0.1.0"
 edition = "2021"
-description = "Native RDP server for macOS"
+description = "Hardware-encoded anland desktop RDP bridge for standard RDP clients"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/collegeming/anland-rdp-bridge"
 publish = false
 
 [[bin]]
-name = "macrdp"
+name = "anland_rdp_bridge"
 path = "src/main.rs"
 
 [dependencies]

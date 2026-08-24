@@ -21,7 +21,7 @@ fn main() {
     cc::Build::new()
         .file("src/usb_redirect/usb_spike.m")
         .flag("-fobjc-arc")
-        .compile("macrdp_usb_spike");
+        .compile("anland_usb_spike");
     println!("cargo:rustc-link-lib=framework=IOUSBHost");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
@@ -34,7 +34,7 @@ fn main() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
             println!(
-                "cargo:warning=xcode-select -p failed; macrdp may not load at runtime. \
+                "cargo:warning=xcode-select -p failed; anland-rdp-bridge may not load at runtime. \
                  Install full Xcode (not just Command Line Tools)."
             );
             return;
