@@ -29,6 +29,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 zeroize = "1"
 rubato = "0.16"  # 48 kHz SCK capture -> 44.1 kHz output, advertised to client
 
+# HMAC-SHA256 mutual auth for the private anland Unix-socket bridge.
+# Versions matched to the proven ironrdp/rustls stack (rustls 0.23 / aws-lc-rs
+# pulls sha2 transitively but not the hmac facade).
+hmac = "0.13"
+sha2 = "0.11"
+
 # TLS for RDP security layer
 rustls = "0.23"
 tokio-rustls = "0.26"
