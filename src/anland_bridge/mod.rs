@@ -26,5 +26,6 @@
 //!   outbound control (start/stop/idr/input/clipboard).
 
 pub mod auth;
+pub mod bridge;
 pub mod transport;
 pub mod wire;
