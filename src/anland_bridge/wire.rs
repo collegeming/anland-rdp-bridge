@@ -33,6 +33,9 @@ pub mod msg {
     pub const IDR_REQUEST: u8 = 17;
     pub const STREAM_START: u8 = 18;
     pub const STREAM_STOP: u8 = 19;
+    pub const AUDIO_CHUNK: u8 = 20;
+    pub const AUDIO_START: u8 = 21;
+    pub const AUDIO_STOP: u8 = 22;
 
     // Authentication messages.
     pub const AUTH_INIT: u8 = 32;
@@ -215,6 +218,77 @@ pub fn encode_stream_start(width: u16, height: u16, fps: u8) -> Vec<u8> {
     out
 }
 
+/// Audio sample format tags carried in `AUDIO_START` / `AUDIO_CHUNK`.
+pub mod audio_format {
+    /// 16-bit signed little-endian interleaved PCM.
+    pub const PCM16LE: u8 = 0;
+    /// Raw AAC-LC access unit (1024 frames, no ADTS/LATM, no in-band ASC).
+    pub const AAC_LC: u8 = 1;
+}
+
+/// A decoded `AUDIO_CHUNK` (message type 20) payload.
+///
+/// Wire layout (little-endian):
+///
+/// ```text
+/// u32 sample_rate
+/// u16 channels
+/// u8  format      (audio_format::PCM16LE or AAC_LC)
+/// u64 timestamp_ms
+/// u8  data[]
+/// ```
+#[derive(Debug, Clone)]
+pub struct AudioWireChunk {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub format: u8,
+    pub timestamp_ms: u64,
+    /// PCM i16LE bytes, or a raw AAC-LC access unit.
+    pub data: Vec<u8>,
+}
+
+impl AudioWireChunk {
+    /// Fixed header size: u32 + u16 + u8 + u64 = 15 bytes.
+    pub const HEADER_LEN: usize = 15;
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        ensure!(
+            payload.len() >= Self::HEADER_LEN,
+            "anland bridge: audio chunk too short ({} < {})",
+            payload.len(),
+            Self::HEADER_LEN
+        );
+        let sample_rate = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let channels = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+        let format = payload[6];
+        let timestamp_ms = u64::from_le_bytes(payload[7..15].try_into().unwrap());
+        let data = payload[Self::HEADER_LEN..].to_vec();
+        ensure!(!data.is_empty(), "anland bridge: audio chunk has empty payload");
+        ensure!(
+            format == audio_format::PCM16LE || format == audio_format::AAC_LC,
+            "anland bridge: unknown audio format {format}"
+        );
+        ensure!(sample_rate > 0, "anland bridge: audio chunk sample rate 0");
+        Ok(Self {
+            sample_rate,
+            channels,
+            format,
+            timestamp_ms,
+            data,
+        })
+    }
+}
+
+/// Encode an `AUDIO_START` payload: `sample_rate:u32, channels:u16, format:u8`.
+/// `aac` selects `audio_format::AAC_LC` vs `PCM16LE`.
+pub fn encode_audio_start(sample_rate: u32, channels: u16, aac: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7);
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.push(if aac { audio_format::AAC_LC } else { audio_format::PCM16LE });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +365,39 @@ mod tests {
         p.extend_from_slice(&1u64.to_le_bytes());
         p.extend_from_slice(&[0xff, 0xfe]);
         assert!(ClipboardUpdate::decode(&p).is_err());
+    }
+
+    #[test]
+    fn audio_chunk_decode() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&44_100u32.to_le_bytes()); // sample_rate
+        p.extend_from_slice(&2u16.to_le_bytes()); // channels
+        p.push(audio_format::PCM16LE); // format
+        p.extend_from_slice(&1_000u64.to_le_bytes()); // timestamp_ms
+        p.extend_from_slice(&[0x10, 0x00, 0x20, 0x00]); // PCM samples
+        let a = AudioWireChunk::decode(&p).unwrap();
+        assert_eq!(a.sample_rate, 44_100);
+        assert_eq!(a.channels, 2);
+        assert_eq!(a.format, audio_format::PCM16LE);
+        assert_eq!(a.timestamp_ms, 1_000);
+        assert_eq!(&a.data, &[0x10, 0x00, 0x20, 0x00]);
+    }
+
+    #[test]
+    fn audio_chunk_rejects_short_and_unknown_format() {
+        let mut short = vec![0u8; AudioWireChunk::HEADER_LEN - 1];
+        assert!(AudioWireChunk::decode(&short).is_err());
+
+        let mut bad = vec![0u8; AudioWireChunk::HEADER_LEN];
+        bad[6] = 0xFF; // unknown format
+        assert!(AudioWireChunk::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn audio_start_encode() {
+        let pcm = encode_audio_start(44_100, 2, false);
+        assert_eq!(pcm[6], audio_format::PCM16LE);
+        let aac = encode_audio_start(48_000, 2, true);
+        assert_eq!(aac[6], audio_format::AAC_LC);
     }
 }

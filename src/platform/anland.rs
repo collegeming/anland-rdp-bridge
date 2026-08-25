@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::anland_bridge::{
-    transport::BridgeEndpoint, AnlandBridge, AnlandBridgeInbound,
+    transport::BridgeEndpoint, wire::AudioWireChunk, AnlandBridge, AnlandBridgeInbound,
     wire::VideoFramePayload,
 };
 
@@ -40,6 +40,9 @@ pub struct AnlandBackends {
     /// Taken once by `video_source`; `None` after the EGFX ship side is
     /// constructed.
     video_rx: Option<mpsc::Receiver<VideoFramePayload>>,
+    /// Audio chunks from Android `AudioRecord` / `MediaCodec` AAC, consumed by
+    /// the RDPSND pump.
+    audio_rx: Option<mpsc::Receiver<AudioWireChunk>>,
     /// Discontinuity flag shared with the EGFX ship side (read on reconnect,
     /// queue overflow, surface loss). Held here so a future ship-side getter
     /// can expose it; the trait doesn't surface it yet.
@@ -69,12 +72,14 @@ impl AnlandBackends {
         let (bridge, inbound) = AnlandBridge::spawn(endpoint, token, width, height, fps, shutdown)?;
         let AnlandBridgeInbound {
             video_frames,
+            audio_chunks,
             video_discontinuity,
             clipboard,
         } = inbound;
         let backends = Self {
             bridge: bridge.clone(),
             video_rx: Some(video_frames),
+            audio_rx: Some(audio_chunks),
             video_discontinuity,
             clipboard_rx: Some(clipboard),
             display: DisplayInfo {
@@ -94,6 +99,12 @@ impl AnlandBackends {
     /// Android clipboard). `None` after the first take.
     pub fn take_clipboard_rx(&mut self) -> Option<watch::Receiver<Option<String>>> {
         self.clipboard_rx.take()
+    }
+
+    /// Take the audio chunk receiver (for the RDPSND pump). `None` after the
+    /// first take.
+    pub fn take_audio_rx(&mut self) -> Option<mpsc::Receiver<AudioWireChunk>> {
+        self.audio_rx.take()
     }
 
     /// The shared discontinuity flag, for the EGFX ship side to read on

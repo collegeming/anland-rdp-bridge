@@ -28,6 +28,7 @@
 /// anland RDP server module.
 pub mod cliprdr;
 pub mod gfx;
+pub mod rdpsnd;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ use crate::anland_bridge::{transport::BridgeEndpoint, AnlandBridge};
 use crate::platform::{AnlandBackends, PlatformBackends};
 use crate::server::cliprdr::AnlandCliprdrFactory;
 use crate::server::gfx::{spawn_video_pump, AnlandGfxFactory};
+use crate::server::rdpsnd::{spawn_audio_pump, AnlandRdpsndFactory};
 
 /// Linux evdev button codes carried on the bridge `MOUSE_BUTTON` payload.
 mod evdev {
@@ -115,6 +117,13 @@ impl AnlandRdpServer {
             .context("backends clipboard_rx already taken")?;
         let cliprdr_factory = AnlandCliprdrFactory::new(bridge.clone(), clipboard_rx);
 
+        // RDPSND audio: bridge audio chunks → the per-connection audio
+        // sender; the factory holds the shared slot the pump writes into.
+        let audio_rx = backends
+            .take_audio_rx()
+            .context("backends audio_rx already taken")?;
+        let (rdpsnd_factory, latest_audio_sender) = AnlandRdpsndFactory::new(bridge.clone());
+
         let display = FixedDisplay {
             width: config.width,
             height: config.height,
@@ -130,7 +139,7 @@ impl AnlandRdpServer {
             .with_input_handler(input)
             .with_display_handler(display)
             .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
-            .with_sound_factory(None)
+            .with_sound_factory(Some(Box::new(rdpsnd_factory)))
             .with_rdpdr_factory(None)
             .with_gfx_factory(Some(Box::new(gfx_factory)))
             .with_usb_factory(None)
@@ -160,6 +169,10 @@ impl AnlandRdpServer {
         } else {
             warn!("anland RDP server: no video source from backends; EGFX pump not started");
         }
+
+        // Spawn the audio pump: forwards Android audio chunks to the RDPSND
+        // sender for the current connection.
+        spawn_audio_pump(audio_rx, latest_audio_sender, shutdown.subscribe());
 
         info!(addr = %config.listen_addr, "anland RDP server initialized");
         // Keep the backends alive for the server's lifetime (the bridge task
