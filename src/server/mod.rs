@@ -26,6 +26,7 @@
 //! BTN_LEFT=272, BTN_RIGHT=273, BTN_MIDDLE=274, BTN_SIDE=275, BTN_EXTRA=276.
 
 /// anland RDP server module.
+pub mod cliprdr;
 pub mod gfx;
 
 use std::net::SocketAddr;
@@ -46,6 +47,7 @@ use tracing::{info, warn};
 
 use crate::anland_bridge::{transport::BridgeEndpoint, AnlandBridge};
 use crate::platform::{AnlandBackends, PlatformBackends};
+use crate::server::cliprdr::AnlandCliprdrFactory;
 use crate::server::gfx::{spawn_video_pump, AnlandGfxFactory};
 
 /// Linux evdev button codes carried on the bridge `MOUSE_BUTTON` payload.
@@ -106,6 +108,13 @@ impl AnlandRdpServer {
         let (gfx_factory, latest_handle, gfx_state) = AnlandGfxFactory::new(bridge.clone());
         let video_source = backends.video_source();
 
+        // CLIPRDR text clipboard: bidirectional CF_UNICODETEXT between the
+        // Android clipboard (bridge watch) and mstsc.
+        let clipboard_rx = backends
+            .take_clipboard_rx()
+            .context("backends clipboard_rx already taken")?;
+        let cliprdr_factory = AnlandCliprdrFactory::new(bridge.clone(), clipboard_rx);
+
         let display = FixedDisplay {
             width: config.width,
             height: config.height,
@@ -120,7 +129,7 @@ impl AnlandRdpServer {
             .with_tls(tls_acceptor)
             .with_input_handler(input)
             .with_display_handler(display)
-            .with_cliprdr_factory(None)
+            .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
             .with_sound_factory(None)
             .with_rdpdr_factory(None)
             .with_gfx_factory(Some(Box::new(gfx_factory)))
