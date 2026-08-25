@@ -24,8 +24,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::anland_bridge::{
-    transport::BridgeEndpoint, wire::AudioWireChunk, AnlandBridge, AnlandBridgeInbound,
-    wire::VideoFramePayload,
+    transport::BridgeEndpoint, wire::VideoFramePayload, AnlandBridge, AnlandBridgeInbound,
 };
 
 use super::{AudioChunk, AudioSource, DisplayInfo, EncodedVideoFrame, PlatformBackends, VideoFrameSource};
@@ -40,9 +39,6 @@ pub struct AnlandBackends {
     /// Taken once by `video_source`; `None` after the EGFX ship side is
     /// constructed.
     video_rx: Option<mpsc::Receiver<VideoFramePayload>>,
-    /// Audio chunks from Android `AudioRecord` / `MediaCodec` AAC, consumed by
-    /// the RDPSND pump.
-    audio_rx: Option<mpsc::Receiver<AudioWireChunk>>,
     /// Discontinuity flag shared with the EGFX ship side (read on reconnect,
     /// queue overflow, surface loss). Held here so a future ship-side getter
     /// can expose it; the trait doesn't surface it yet.
@@ -78,7 +74,6 @@ impl AnlandBackends {
         let (bridge, inbound) = AnlandBridge::spawn(endpoint, token, width, height, fps, shutdown)?;
         let AnlandBridgeInbound {
             video_frames,
-            audio_chunks,
             video_discontinuity,
             clipboard,
             clipboard_image,
@@ -88,7 +83,6 @@ impl AnlandBackends {
         let backends = Self {
             bridge: bridge.clone(),
             video_rx: Some(video_frames),
-            audio_rx: Some(audio_chunks),
             video_discontinuity,
             clipboard_rx: Some(clipboard),
             clipboard_image_rx: Some(clipboard_image),
@@ -130,12 +124,6 @@ impl AnlandBackends {
         &mut self,
     ) -> Option<mpsc::Receiver<crate::anland_bridge::wire::FileContentResponse>> {
         self.file_content_rx.take()
-    }
-
-    /// Take the audio chunk receiver (for the RDPSND pump). `None` after the
-    /// first take.
-    pub fn take_audio_rx(&mut self) -> Option<mpsc::Receiver<AudioWireChunk>> {
-        self.audio_rx.take()
     }
 
     /// The shared discontinuity flag, for the EGFX ship side to read on

@@ -38,8 +38,6 @@ use super::wire::{self, msg, ClipboardUpdate, VideoFramePayload};
 pub struct AnlandBridgeInbound {
     /// Already-encoded H.264 AVC420 frames from Android `MediaCodec`.
     pub video_frames: mpsc::Receiver<VideoFramePayload>,
-    /// Audio chunks from Android `AudioRecord` / `MediaCodec` AAC.
-    pub audio_chunks: mpsc::Receiver<wire::AudioWireChunk>,
     /// Set when the EGFX pipeline detects a discontinuity (reconnect,
     /// queue overflow, surface loss, capability re-advertise) so the ship
     /// side clears its prediction chain and waits for a fresh keyframe.
@@ -64,10 +62,6 @@ pub enum OutboundCmd {
     StreamStart { width: u16, height: u16, fps: u8 },
     StreamStop,
     IdrRequest,
-    /// Tell Android to start capturing audio: PCM i16LE at `sample_rate`/
-    /// `channels`, or raw AAC-LC (`aac`).
-    AudioStart { sample_rate: u32, channels: u16, aac: bool },
-    AudioStop,
     Key { action: u8, keycode: u32 },
     MouseMotion {
         stream_id: u32,
@@ -120,7 +114,6 @@ impl AnlandBridge {
         shutdown: broadcast::Receiver<()>,
     ) -> Result<(Self, AnlandBridgeInbound)> {
         let (video_tx, video_rx) = mpsc::channel::<VideoFramePayload>(8);
-        let (audio_tx, audio_rx) = mpsc::channel::<wire::AudioWireChunk>(16);
         let (clipboard_tx, clipboard_rx) = watch::channel(None);
         let (clipboard_image_tx, clipboard_image_rx) = watch::channel(None);
         let (file_list_tx, file_list_rx) = watch::channel(None);
@@ -140,7 +133,6 @@ impl AnlandBridge {
 
         let inbound = AnlandBridgeInbound {
             video_frames: video_rx,
-            audio_chunks: audio_rx,
             video_discontinuity: Arc::clone(&video_discontinuity),
             clipboard: clipboard_rx,
             clipboard_image: clipboard_image_rx,
@@ -152,7 +144,6 @@ impl AnlandBridge {
             endpoint: endpoint.clone(),
             token: token.to_vec(),
             video_tx,
-            audio_tx,
             clipboard_tx,
             clipboard_image_tx,
             file_list_tx,
@@ -186,20 +177,6 @@ impl AnlandBridge {
             *g = None;
         }
         let _ = self.outbound.send(OutboundCmd::StreamStop);
-    }
-
-    /// Tell Android to start capturing audio (PCM i16LE, or AAC-LC if `aac`).
-    pub fn start_audio(&self, sample_rate: u32, channels: u16, aac: bool) {
-        let _ = self.outbound.send(OutboundCmd::AudioStart {
-            sample_rate,
-            channels,
-            aac,
-        });
-    }
-
-    /// Tell Android to stop capturing audio.
-    pub fn stop_audio(&self) {
-        let _ = self.outbound.send(OutboundCmd::AudioStop);
     }
 
     pub fn request_idr(&self) {
@@ -267,7 +244,6 @@ struct SessionRunner {
     endpoint: BridgeEndpoint,
     token: Vec<u8>,
     video_tx: mpsc::Sender<VideoFramePayload>,
-    audio_tx: mpsc::Sender<wire::AudioWireChunk>,
     clipboard_tx: watch::Sender<Option<String>>,
     clipboard_image_tx: watch::Sender<Option<Vec<u8>>>,
     file_list_tx: watch::Sender<Option<Vec<wire::FileEntry>>>,
@@ -360,7 +336,6 @@ impl SessionRunner {
         // dispatch/write paths take the cloned handles, avoiding a whole-`self`
         // borrow that would conflict with that field borrow.
         let video_tx = self.video_tx.clone();
-        let audio_tx = self.audio_tx.clone();
         let clipboard_tx = self.clipboard_tx.clone();
         let clipboard_image_tx = self.clipboard_image_tx.clone();
         let file_list_tx = self.file_list_tx.clone();
@@ -382,7 +357,6 @@ impl SessionRunner {
                                 frame.msg_type,
                                 &frame.payload,
                                 &video_tx,
-                                &audio_tx,
                                 &clipboard_tx,
                                 &clipboard_image_tx,
                                 &file_list_tx,
@@ -431,7 +405,6 @@ impl SessionRunner {
         msg_type: u8,
         data: &[u8],
         video_tx: &mpsc::Sender<VideoFramePayload>,
-        audio_tx: &mpsc::Sender<wire::AudioWireChunk>,
         clipboard_tx: &watch::Sender<Option<String>>,
         clipboard_image_tx: &watch::Sender<Option<Vec<u8>>>,
         file_list_tx: &watch::Sender<Option<Vec<wire::FileEntry>>>,
@@ -450,18 +423,6 @@ impl SessionRunner {
                 Err(e) => {
                     warn!("anland bridge: bad video frame: {e}");
                     video_discontinuity.store(true, Ordering::Release);
-                    true
-                }
-            },
-            msg::AUDIO_CHUNK => match wire::AudioWireChunk::decode(data) {
-                Ok(chunk) => {
-                    if audio_tx.send(chunk).await.is_err() {
-                        debug!("anland bridge: audio channel closed");
-                    }
-                    true
-                }
-                Err(e) => {
-                    warn!("anland bridge: bad audio chunk: {e}");
                     true
                 }
             },
@@ -564,15 +525,6 @@ impl SessionRunner {
             }
             OutboundCmd::StreamStop => (msg::STREAM_STOP, Vec::new()),
             OutboundCmd::IdrRequest => (msg::IDR_REQUEST, Vec::new()),
-            OutboundCmd::AudioStart {
-                sample_rate,
-                channels,
-                aac,
-            } => (
-                msg::AUDIO_START,
-                wire::encode_audio_start(sample_rate, channels, aac),
-            ),
-            OutboundCmd::AudioStop => (msg::AUDIO_STOP, Vec::new()),
             OutboundCmd::Key { action, keycode } => {
                 let mut p = Vec::with_capacity(5);
                 p.push(action);
