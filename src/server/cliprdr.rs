@@ -23,19 +23,23 @@
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FormatDataRequest,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
     FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp_core::AsAny;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
+use crate::anland_bridge::wire::{FileContentResponse as WireFileContent, FileEntry};
 use crate::anland_bridge::AnlandBridge;
 
 /// CF_UNICODETEXT (13) and CF_DIB (8) — the Windows clipboard constants.
@@ -43,7 +47,8 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_DIB: u32 = 8;
 
 /// Anland CLIPRDR factory: clones the bridge handle + the Android clipboard
-/// text/image watch receivers per connection.
+/// text/image/file-list watches + the shared file-content receiver per
+/// connection.
 #[derive(Clone)]
 pub struct AnlandCliprdrFactory {
     bridge: AnlandBridge,
@@ -51,6 +56,11 @@ pub struct AnlandCliprdrFactory {
     clipboard_rx: watch::Receiver<Option<String>>,
     /// Latest Android clipboard image, PNG bytes (cloned per-connection).
     clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
+    /// Latest Android clipboard file list (cloned per-connection).
+    file_list_rx: watch::Receiver<Option<Vec<FileEntry>>>,
+    /// Shared file-content response receiver (RANGE requests correlate by
+    /// `request_id` = CLIPRDR `stream_id`).
+    file_content_rx: Arc<Mutex<mpsc::Receiver<WireFileContent>>>,
     /// Monotonic sequence for mstsc→Android updates (must be non-zero).
     next_seq: std::sync::Arc<AtomicU64>,
 }
@@ -60,11 +70,15 @@ impl AnlandCliprdrFactory {
         bridge: AnlandBridge,
         clipboard_rx: watch::Receiver<Option<String>>,
         clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
+        file_list_rx: watch::Receiver<Option<Vec<FileEntry>>>,
+        file_content_rx: mpsc::Receiver<WireFileContent>,
     ) -> Self {
         Self {
             bridge,
             clipboard_rx,
             clipboard_image_rx,
+            file_list_rx,
+            file_content_rx: Arc::new(Mutex::new(file_content_rx)),
             next_seq: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -83,6 +97,8 @@ impl CliprdrBackendFactory for AnlandCliprdrFactory {
             sender: None,
             clipboard_rx: self.clipboard_rx.clone(),
             clipboard_image_rx: self.clipboard_image_rx.clone(),
+            file_list_rx: self.file_list_rx.clone(),
+            file_content_rx: Arc::clone(&self.file_content_rx),
             next_seq: std::sync::Arc::clone(&self.next_seq),
             pending_request: None,
         })
@@ -98,6 +114,8 @@ pub struct AnlandCliprdrBackend {
     sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     clipboard_rx: watch::Receiver<Option<String>>,
     clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
+    file_list_rx: watch::Receiver<Option<Vec<FileEntry>>>,
+    file_content_rx: Arc<Mutex<mpsc::Receiver<WireFileContent>>>,
     next_seq: std::sync::Arc<AtomicU64>,
     /// Which format we last asked the client for; `on_format_data_response`
     /// routes on this (the response carries no format id).
@@ -113,9 +131,22 @@ impl std::fmt::Debug for AnlandCliprdrBackend {
 }
 
 impl AnlandCliprdrBackend {
-    /// Advertise CF_UNICODETEXT (always) + CF_DIB (when an image is present).
+    /// Advertise: files → `ClipboardFileCopy` (registers `local_file_list` so
+    /// `FileContentsRequest`s are serviced); otherwise CF_UNICODETEXT (always)
+    /// + CF_DIB (when an image is present).
     fn advertise(&mut self) {
         if let Some(sender) = &self.sender {
+            if let Some(entries) = self.current_files() {
+                let files = build_descriptors(&entries);
+                if !files.is_empty() {
+                    let _ = sender.send(ServerEvent::ClipboardFileCopy(files));
+                    debug!(
+                        count = entries.len(),
+                        "anland cliprdr: advertised file copy"
+                    );
+                    return;
+                }
+            }
             let mut formats = vec![ClipboardFormat::new(ClipboardFormatId::new(CF_UNICODETEXT))];
             if self.current_image().is_some() {
                 formats.push(ClipboardFormat::new(ClipboardFormatId::new(CF_DIB)));
@@ -126,6 +157,11 @@ impl AnlandCliprdrBackend {
             )));
             debug!("anland cliprdr: advertised {count} format(s)");
         }
+    }
+
+    /// Current Android clipboard file list, if any.
+    fn current_files(&self) -> Option<Vec<FileEntry>> {
+        self.file_list_rx.borrow().clone()
     }
 
     /// Current Android clipboard text (cloned from the watch).
@@ -145,8 +181,10 @@ impl CliprdrBackend for AnlandCliprdrBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        // Text + image only: no file/object capabilities.
+        // Text + image + file. STREAM_FILECLIP_ENABLED is REQUIRED for file
+        // paste — without it the cliprdr server refuses FileContentsRequests.
         ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
     }
 
     fn on_ready(&mut self) {
@@ -248,9 +286,79 @@ impl CliprdrBackend for AnlandCliprdrBackend {
         }
     }
 
-    fn on_file_contents_request(&mut self, _request: ironrdp_cliprdr::pdu::FileContentsRequest) {
-        // File copy is not supported yet (bridge wire extension pending).
-        debug!("anland cliprdr: file contents request (unsupported); ignoring");
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        // Files live on Android; the request crosses the bridge asynchronously.
+        // SIZE is answered synchronously from the file-list watch (we already
+        // know the size); RANGE spawns a task that sends FILE_CONTENT_REQUEST
+        // and awaits the matching FILE_CONTENT_RESPONSE.
+        let idx = match usize::try_from(request.index) {
+            Ok(i) => i,
+            Err(_) => {
+                warn!(index = request.index, "anland cliprdr: bad file index");
+                return;
+            }
+        };
+        let stream_id = request.stream_id;
+
+        if request.flags.contains(FileContentsFlags::SIZE) {
+            let size = self
+                .current_files()
+                .and_then(|entries| entries.get(idx).map(|e| e.size));
+            let response = match size {
+                Some(size) => FileContentsResponse::new_size_response(stream_id, size),
+                None => FileContentsResponse::new_error(stream_id),
+            };
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(ServerEvent::Clipboard(
+                    ClipboardMessage::SendFileContentsResponse(response),
+                ));
+            }
+            debug!(stream_id, size, "anland cliprdr: served SIZE");
+            return;
+        }
+
+        if request.flags.contains(FileContentsFlags::RANGE) {
+            let bridge = self.bridge.clone();
+            let sender = self.sender.clone();
+            let rx = Arc::clone(&self.file_content_rx);
+            let position = request.position;
+            let requested_size = request.requested_size;
+            tokio::spawn(async move {
+                bridge.request_file_content(stream_id, idx as u32, position, requested_size);
+                // Await the response correlated by stream_id (== request_id),
+                // with a timeout so a vanished Android side can't leak a task.
+                let data = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    async {
+                        loop {
+                            let resp = rx.lock().await.recv().await?;
+                            if resp.request_id == stream_id {
+                                return Some(resp.data);
+                            }
+                        }
+                    },
+                )
+                .await
+                {
+                    Ok(Some(data)) => data,
+                    _ => Vec::new(),
+                };
+                let response = if data.is_empty() {
+                    FileContentsResponse::new_error(stream_id)
+                } else {
+                    FileContentsResponse::new_data_response(stream_id, data)
+                };
+                if let Some(s) = sender {
+                    let _ = s.send(ServerEvent::Clipboard(
+                        ClipboardMessage::SendFileContentsResponse(response),
+                    ));
+                }
+            });
+            debug!(stream_id, index = idx, position, "anland cliprdr: RANGE requested");
+            return;
+        }
+
+        warn!(flags = ?request.flags, "anland cliprdr: unknown FileContentsRequest flags");
     }
 
     fn on_file_contents_response(&mut self, _response: ironrdp_cliprdr::pdu::FileContentsResponse<'_>) {
@@ -279,9 +387,21 @@ impl ServerEventSender for AnlandCliprdrBackend {
     }
 }
 
+/// Build CLIPRDR `FileDescriptor`s from the bridge file entries (normal files
+/// with their size; directories would use DIRECTORY attributes).
+fn build_descriptors(entries: &[FileEntry]) -> Vec<FileDescriptor> {
+    entries
+        .iter()
+        .map(|e| {
+            FileDescriptor::new(e.name.clone())
+                .with_attributes(ClipboardFileAttributes::NORMAL)
+                .with_file_size(e.size)
+        })
+        .collect()
+}
+
 /// Decode UTF-16LE bytes (with optional trailing NUL) to a Rust String.
-fn decode_utf16(bytes: &[u8]) -> String {
-    let mut units = Vec::with_capacity(bytes.len() / 2);
+fn decode_utf16(bytes: &[u8]) -> String {    let mut units = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
     while i + 1 < bytes.len() {
         units.push(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
