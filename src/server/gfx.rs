@@ -198,6 +198,10 @@ pub fn spawn_video_pump(
     event_tx: mpsc::UnboundedSender<ServerEvent>,
     bridge: AnlandBridge,
     display_suppressed: Arc<AtomicBool>,
+    // Set by the bridge on Android reconnect / bad frame — the pump treats it
+    // as a discontinuity (clear the prediction chain, request an IDR, drop
+    // P-frames until a fresh keyframe).
+    bridge_discontinuity: Arc<AtomicBool>,
     display_width: u16,
     display_height: u16,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -221,6 +225,9 @@ pub fn spawn_video_pump(
                         &bridge, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
+                    if bridge_discontinuity.swap(false, Ordering::AcqRel) {
+                        enter_discontinuity(&bridge, &mut awaiting_idr);
+                    }
                 }
                 frame = source.next_frame() => {
                     let frame = match frame {
@@ -236,6 +243,9 @@ pub fn spawn_video_pump(
                         &bridge, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
+                    if bridge_discontinuity.swap(false, Ordering::AcqRel) {
+                        enter_discontinuity(&bridge, &mut awaiting_idr);
+                    }
                     if stream_paused || display_suppressed.load(Ordering::Acquire) {
                         continue;
                     }
