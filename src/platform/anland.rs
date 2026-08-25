@@ -49,6 +49,8 @@ pub struct AnlandBackends {
     video_discontinuity: Arc<AtomicBool>,
     /// Latest coalesced clipboard from Android, for the CLIPRDR side.
     clipboard_rx: Option<watch::Receiver<Option<String>>>,
+    /// Latest coalesced clipboard image (PNG bytes), for the CLIPRDR side.
+    clipboard_image_rx: Option<watch::Receiver<Option<Vec<u8>>>>,
     display: DisplayInfo,
     /// Stream geometry/FPS, passed to `AnlandVideoSource::start`.
     width: u16,
@@ -75,6 +77,7 @@ impl AnlandBackends {
             audio_chunks,
             video_discontinuity,
             clipboard,
+            clipboard_image,
         } = inbound;
         let backends = Self {
             bridge: bridge.clone(),
@@ -82,6 +85,7 @@ impl AnlandBackends {
             audio_rx: Some(audio_chunks),
             video_discontinuity,
             clipboard_rx: Some(clipboard),
+            clipboard_image_rx: Some(clipboard_image),
             display: DisplayInfo {
                 width,
                 height,
@@ -99,6 +103,11 @@ impl AnlandBackends {
     /// Android clipboard). `None` after the first take.
     pub fn take_clipboard_rx(&mut self) -> Option<watch::Receiver<Option<String>>> {
         self.clipboard_rx.take()
+    }
+
+    /// Take the clipboard image watch receiver. `None` after the first take.
+    pub fn take_clipboard_image_rx(&mut self) -> Option<watch::Receiver<Option<Vec<u8>>>> {
+        self.clipboard_image_rx.take()
     }
 
     /// Take the audio chunk receiver (for the RDPSND pump). `None` after the
