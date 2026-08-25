@@ -23,12 +23,10 @@
 //! 4. Mark session connected; forward current input/video/clipboard traffic
 //!    until the client disconnects.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
+use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -294,7 +292,7 @@ impl SessionRunner {
         let clipboard_tx = self.clipboard_tx.clone();
         let video_discontinuity = Arc::clone(&self.video_discontinuity);
         let connected = Arc::clone(&self.connected);
-        let mut outbound = &mut self.outbound_rx;
+        let outbound = &mut self.outbound_rx;
         let mut shutdown = self.shutdown.resubscribe();
         loop {
             tokio::select! {

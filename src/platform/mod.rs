@@ -78,7 +78,7 @@ pub struct EncodedVideoFrame {
 /// flow in the other direction — the ship side drives the source on reconnect,
 /// display suppression, and IDR recovery.
 #[async_trait::async_trait]
-pub trait VideoFrameSource: Send + Sync {
+pub trait VideoFrameSource: Send {
     /// Await the next encoded frame, or `Ok(None)` if the source ended.
     async fn next_frame(&mut self) -> anyhow::Result<Option<EncodedVideoFrame>>;
 
@@ -127,7 +127,7 @@ pub enum AudioChunk {
 /// encoding if it advertised AAC); resampling to the client's rate happens
 /// here when the capture rate differs.
 #[async_trait::async_trait]
-pub trait AudioSource: Send + Sync {
+pub trait AudioSource: Send {
     /// Await the next audio chunk matching the negotiated format, or `Ok(None)`
     /// if the source ended.
     async fn next_chunk(&mut self) -> anyhow::Result<Option<AudioChunk>>;
@@ -159,23 +159,17 @@ pub struct DisplayInfo {
 /// frame source, `AudioRecord`, native input, and clipboard manager reached
 /// over the private anland Unix socket bridge. The RDP server builder is
 /// wired with whichever set the target platform selects.
-pub trait PlatformBackends: Send + Sync {
+///
+/// `Send` (not `Send + Sync`): the backends own single-consumer channels
+/// (e.g. `mpsc::Receiver`) that are `Send` but not `Sync`. The RDP server
+/// drives them from a dedicated task/thread, so `Sync` is not required.
+pub trait PlatformBackends: Send {
     /// The frame source feeding the EGFX ship pipeline. `None` if EGFX AVC420
-    /// is not in use (legacy bitmap path).
-    fn video_source(&self) -> Option<Box<dyn VideoFrameSource>>;
+    /// is not in use (legacy bitmap path). Takes the receiver out of the
+    /// backends (`&mut self`) — the source is constructed once.
+    fn video_source(&mut self) -> Option<Box<dyn VideoFrameSource + Send>>;
     /// The audio source feeding RDPSND. `None` if audio is disabled.
-    fn audio_source(&self) -> Option<Box<dyn AudioSource>>;
+    fn audio_source(&mut self) -> Option<Box<dyn AudioSource + Send>>;
     /// Display geometry for the surface and input coordinate space.
     fn display_info(&self) -> DisplayInfo;
-}
-
-/// Select the platform backends for the anland target.
-///
-/// This module only compiles on non-macOS (the anland / Droidspaces target is
-/// Arch Linux ARM). The macOS build keeps its existing direct backend wiring
-/// in the top-level modules; the migration step will later unify both
-/// platforms behind these traits.
-#[cfg(not(target_os = "macos"))]
-pub fn select_backends() -> anyhow::Result<Box<dyn PlatformBackends>> {
-    Ok(Box::new(AnlandBackends::new()?))
 }
