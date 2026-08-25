@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ironrdp_dvc::encode_dvc_messages;
-use ironrdp_egfx::pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV81Flags, CapabilitySet};
+use ironrdp_egfx::pdu::{
+    Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV10Flags, CapabilitiesV107Flags,
+    CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet,
+};
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, Surface};
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent, ServerEventSender,
@@ -126,9 +129,29 @@ impl GraphicsPipelineHandler for AnlandGraphicsHandler {
     }
 
     fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
-        vec![CapabilitySet::V8_1 {
-            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-        }]
+        // V10.x FIRST, in the upstream IronRDP order. This is load-bearing for
+        // mstsc: V8.1 requires the client to explicitly set AVC420_ENABLED
+        // (0x10), which mstsc does not send (it sends 0x0) — advertising only
+        // V8.1 (the lamco approach) makes the negotiation land on V8.1 and
+        // mstsc fails AVC420 → no video. V10.x has INVERTED semantics: 0x0
+        // (AVC_DISABLED unset) means AVC is ENABLED, and mstsc's 0x0 then
+        // negotiates AVC420 correctly. xrdp / FreeRDP shadow advertise V10 for
+        // the same reason. V8.1 stays as the fallback for clients that speak
+        // only V8.1 and DO set AVC420_ENABLED.
+        vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            },
+        ]
     }
 }
 
