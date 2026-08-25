@@ -1,22 +1,27 @@
-//! RDPSND audio: forwards Android audio (PCM i16LE, or raw AAC-LC access
-//! units) from the anland bridge to `mstsc`.
+//! RDPSND audio: forwards the **Linux desktop** audio (niri/anland playback,
+//! captured on the Linux side via the platform [`AudioSource`]) to `mstsc`.
 //!
-//! ## Design (mirrors the EGFX video pump)
+//! ## Architecture (corrected)
 //!
-//! A single [`spawn_audio_pump`] task owns the bridge's audio receiver and
-//! forwards each [`AudioWireChunk`] to the *latest* RDPSND audio sender. The
-//! per-connection [`AnlandRdpsndBackend`] (built by the factory) writes its
-//! dedicated `AudioWave` sender into a shared slot on
+//! The shared desktop is the Arch/niri Linux session; its audio is produced by
+//! Linux apps and played through the Android speaker via the anland audio
+//! socket (see the consumer's `anland_audio.c` — a PipeWire sink-monitor
+//! capture of desktop playback). The RDP client must hear that same Linux
+//! audio, so the capture point is **on the Linux side**, not Android and not
+//! over the bridge. [`AnlandAudioSource`] is the Linux capture backend
+//! (PipeWire sink-monitor, mirroring `anland_audio.c`).
+//!
+//! A single [`spawn_audio_pump`] task owns the [`AudioSource`] and forwards
+//! each [`AudioChunk`] to the *latest* RDPSND audio sender. The per-connection
+//! [`AnlandRdpsndBackend`] (built by the factory) writes its dedicated
+//! `AudioWave` sender into a shared slot on
 //! [`SoundServerFactory::set_audio_sender`], so the pump always feeds the
-//! current connection's dispatch task. `start`/`stop` just tell Android to
-//! capture via the bridge (`AUDIO_START` / `AUDIO_STOP`); the pump idles when
-//! Android is not sending.
+//! current connection's dispatch task.
 //!
 //! Formats advertised: PCM (44.1 kHz / stereo / 16-bit) — always available.
-//! AAC-LC (`WAVE_FORMAT_AAC_MS`) is structured in (the wire carries
-//! `audio_format::AAC_LC`, and `make_wave` tags the AAC packet duration) but
-//! not yet advertised — the Android `MediaCodec` AAC encoder backend is a
-//! follow-up. `choose_format` prefers AAC when it is present.
+//! AAC-LC (`WAVE_FORMAT_AAC_MS`) is structured in (the source may yield
+//! `AudioChunk::Aac` and `make_wave` tags the packet duration) but not yet
+//! advertised — the Linux AAC encoder is a follow-up.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,8 +33,7 @@ use ironrdp_server::{AudioWave, SoundServerFactory, ServerEvent, ServerEventSend
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
-use crate::anland_bridge::wire::{self, AudioWireChunk};
-use crate::anland_bridge::AnlandBridge;
+use crate::platform::{AudioChunk, AudioSource};
 
 /// PCM capture/playback parameters (44.1 kHz stereo 16-bit — the Windows
 /// audio default).
@@ -38,32 +42,19 @@ const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
 /// RDPSND factory: builds a per-connection backend and holds the shared
-/// audio-sender slot + last-negotiated-format cell the pump reads.
+/// audio-sender slot the pump writes into.
 pub struct AnlandRdpsndFactory {
-    bridge: AnlandBridge,
     /// Latest RDPSND audio sender, set per connection; the pump reads it.
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
-    /// Last negotiated capture format `(sample_rate, channels, aac)`; the pump
-    /// uses it to restart Android capture after display-suppression.
-    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
 }
 
 impl AnlandRdpsndFactory {
-    pub fn new(
-        bridge: AnlandBridge,
-    ) -> (
-        Self,
-        Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
-        Arc<Mutex<Option<(u32, u16, bool)>>>,
-    ) {
+    pub fn new() -> (Self, Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>) {
         let latest_audio_sender = Arc::new(Mutex::new(None));
-        let last_format = Arc::new(Mutex::new(None));
         let factory = Self {
-            bridge,
             latest_audio_sender: Arc::clone(&latest_audio_sender),
-            last_format: Arc::clone(&last_format),
         };
-        (factory, latest_audio_sender, last_format)
+        (factory, latest_audio_sender)
     }
 }
 
@@ -77,9 +68,7 @@ impl ServerEventSender for AnlandRdpsndFactory {
 impl SoundServerFactory for AnlandRdpsndFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(AnlandRdpsndBackend {
-            bridge: self.bridge.clone(),
             latest_audio_sender: Arc::clone(&self.latest_audio_sender),
-            last_format: Arc::clone(&self.last_format),
         })
     }
 
@@ -92,9 +81,7 @@ impl SoundServerFactory for AnlandRdpsndFactory {
 
 /// Per-connection RDPSND backend.
 pub struct AnlandRdpsndBackend {
-    bridge: AnlandBridge,
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
-    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
 }
 
 impl std::fmt::Debug for AnlandRdpsndBackend {
@@ -105,7 +92,7 @@ impl std::fmt::Debug for AnlandRdpsndBackend {
 
 impl RdpsndServerHandler for AnlandRdpsndBackend {
     fn get_formats(&self) -> &[AudioFormat] {
-        // Static PCM format. AAC advertised when the Android AAC backend lands.
+        // Static PCM format. AAC advertised when the Linux AAC encoder lands.
         static FORMATS: [AudioFormat; 1] = [AudioFormat {
             format: WaveFormat::PCM,
             n_channels: CHANNELS,
@@ -128,43 +115,31 @@ impl RdpsndServerHandler for AnlandRdpsndBackend {
     }
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
-        // `format.format()` is the negotiated AudioFormat; the crate stamps
-        // its wFormatNo onto every wave. Tell Android whether to capture PCM
-        // or AAC, and let the pump forward whatever arrives.
+        // The pump pulls from the Linux AudioSource and the crate stamps each
+        // wave with the negotiated wFormatNo. Nothing to start here — the
+        // source is driven by the pump (started on negotiation / resume).
         let af = format.format();
-        let use_aac = af.format == WaveFormat::AAC_MS;
-        let sample_rate = af.n_samples_per_sec;
-        let channels = af.n_channels;
         debug!(
-            use_aac,
-            sample_rate, channels, "anland rdpsnd: audio streaming starting"
+            use_aac = af.format == WaveFormat::AAC_MS,
+            sample_rate = af.n_samples_per_sec,
+            channels = af.n_channels,
+            "anland rdpsnd: audio streaming starting"
         );
-        if let Ok(mut slot) = self.last_format.lock() {
-            *slot = Some((sample_rate, channels, use_aac));
-        }
-        self.bridge.start_audio(sample_rate, channels, use_aac);
         Ok(())
     }
 
     fn stop(&mut self) {
         debug!("anland rdpsnd: audio streaming stopped");
-        if let Ok(mut slot) = self.last_format.lock() {
-            *slot = None;
-        }
-        self.bridge.stop_audio();
     }
 }
 
-/// Spawn the audio pump: forward Android audio chunks to the current RDPSND
-/// sender. Idles when Android is not capturing; mutes on display suppression
-/// (client minimized) by telling Android to stop; ends on shutdown or when the
-/// bridge disconnects.
+/// Spawn the audio pump: forward Linux desktop audio chunks from the platform
+/// [`AudioSource`] to the current RDPSND sender. Mutes on display suppression
+/// (client minimized) by stopping the source; ends on shutdown.
 pub fn spawn_audio_pump(
-    mut audio_rx: mpsc::Receiver<AudioWireChunk>,
+    mut audio_source: Box<dyn AudioSource + Send>,
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
-    bridge: AnlandBridge,
     display_suppressed: Arc<AtomicBool>,
-    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
@@ -176,13 +151,21 @@ pub fn spawn_audio_pump(
                 _ = shutdown_rx.recv() => break,
                 _ = poll.tick() => {
                     update_audio_suppression(
-                        &bridge, &display_suppressed, &last_format, &mut paused,
+                        &mut audio_source, &display_suppressed, &mut paused,
                     );
                 }
-                chunk = audio_rx.recv() => {
-                    let Some(chunk) = chunk else { break };
+                chunk = audio_source.next_chunk() => {
+                    let chunk = match chunk {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,
+                        Err(e) => {
+                            debug!("anland rdpsnd: audio source ended: {e}");
+                            break;
+                        }
+                    };
+
                     update_audio_suppression(
-                        &bridge, &display_suppressed, &last_format, &mut paused,
+                        &mut audio_source, &display_suppressed, &mut paused,
                     );
                     if paused || display_suppressed.load(Ordering::Acquire) {
                         continue; // muted while minimized
@@ -205,17 +188,14 @@ pub fn spawn_audio_pump(
     });
 }
 
-/// Stop Android capture after display suppression; restart it (with the last
-/// negotiated format) on resume.
+/// Stop the Linux capture after display suppression; restart it on resume.
 fn update_audio_suppression(
-    bridge: &AnlandBridge,
+    audio_source: &mut Box<dyn AudioSource + Send>,
     display_suppressed: &AtomicBool,
-    last_format: &Mutex<Option<(u32, u16, bool)>>,
     paused: &mut bool,
-) {
-    if display_suppressed.load(Ordering::Acquire) {
+) {    if display_suppressed.load(Ordering::Acquire) {
         if !*paused {
-            bridge.stop_audio();
+            audio_source.stop();
             *paused = true;
             debug!("anland rdpsnd: muted (display suppressed)");
         }
@@ -223,25 +203,32 @@ fn update_audio_suppression(
     }
     if *paused {
         *paused = false;
-        if let Ok(slot) = last_format.lock() {
-            if let Some((sr, ch, aac)) = *slot {
-                bridge.start_audio(sr, ch, aac);
-                debug!("anland rdpsnd: resumed (display restored)");
-            }
-        }
+        audio_source.start();
+        debug!("anland rdpsnd: resumed (display restored)");
     }
 }
 
-/// Convert a wire audio chunk to an `AudioWave` for the RDPSND dispatch task.
+/// Convert an [`AudioChunk`] to an `AudioWave` for the RDPSND dispatch task.
 /// PCM waves carry no duration; AAC access units carry their 1024-frame
 /// packet duration so the vendor audio-lag model sizes the client buffer.
-fn make_wave(chunk: &AudioWireChunk) -> AudioWave {
-    let ts = chunk.timestamp_ms.min(u64::from(u32::MAX)) as u32;
-    let duration = if chunk.format == wire::audio_format::AAC_LC {
-        // 1024 frames per AAC-LC access unit → ms.
-        Some(1024.0 / f64::from(chunk.sample_rate) * 1000.0)
-    } else {
-        None
-    };
-    (chunk.data.clone(), ts, duration)
+fn make_wave(chunk: &AudioChunk) -> AudioWave {
+    match chunk {
+        AudioChunk::Pcm {
+            samples,
+            sample_rate: _,
+            channels: _,
+            pts_ms,
+        } => (samples.clone(), (*pts_ms).min(i64::from(u32::MAX)) as u32, None),
+        AudioChunk::Aac {
+            access_unit,
+            sample_rate,
+            channels: _,
+            pts_ms,
+        } => (
+            access_unit.clone(),
+            (*pts_ms).min(i64::from(u32::MAX)) as u32,
+            // 1024 frames per AAC-LC access unit → ms.
+            Some(1024.0 / f64::from(*sample_rate) * 1000.0),
+        ),
+    }
 }

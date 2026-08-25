@@ -132,23 +132,19 @@ impl AnlandRdpServer {
             file_content_rx,
         );
 
-        // RDPSND audio: bridge audio chunks → the per-connection audio
-        // sender; the factory holds the shared slot the pump writes into plus
-        // the last negotiated format for mute/resume.
-        let audio_rx = backends
-            .take_audio_rx()
-            .context("backends audio_rx already taken")?;
-        let (rdpsnd_factory, latest_audio_sender, audio_last_format) =
-            AnlandRdpsndFactory::new(bridge.clone());
+        // RDPSND audio: the Linux desktop capture backend (from the platform
+        // backends) feeds the per-connection audio sender; the factory holds
+        // the shared slot the pump writes into.
+        let audio_source = backends.audio_source();
+        let (rdpsnd_factory, latest_audio_sender) = AnlandRdpsndFactory::new();
 
         let display = FixedDisplay {
             width: config.width,
             height: config.height,
         };
-        // Clone the bridge for the video/audio pumps before moving it into
-        // the input handler (which forwards keyboard/mouse through it).
+        // Clone the bridge for the video pump before moving it into the input
+        // handler (which forwards keyboard/mouse through it).
         let bridge_for_pump = bridge.clone();
-        let bridge_for_audio = bridge.clone();
         let input = AnlandInputHandler { bridge };
 
         let mut rdp_server = RdpServer::builder()
@@ -192,16 +188,20 @@ impl AnlandRdpServer {
             warn!("anland RDP server: no video source from backends; EGFX pump not started");
         }
 
-        // Spawn the audio pump: forwards Android audio chunks to the RDPSND
-        // sender for the current connection; mutes on display suppression.
-        spawn_audio_pump(
-            audio_rx,
-            latest_audio_sender,
-            bridge_for_audio,
-            display_suppressed.clone(),
-            audio_last_format,
-            shutdown.subscribe(),
-        );
+        // Spawn the audio pump: forwards Linux desktop audio chunks to the
+        // RDPSND sender for the current connection; mutes on display
+        // suppression. Audio is optional — the capture backend may be absent
+        // until the PipeWire sink-monitor source is wired.
+        if let Some(audio_source) = audio_source {
+            spawn_audio_pump(
+                audio_source,
+                latest_audio_sender,
+                display_suppressed.clone(),
+                shutdown.subscribe(),
+            );
+        } else {
+            warn!("anland RDP server: no audio source from backends; RDPSND pump not started");
+        }
 
         info!(addr = %config.listen_addr, "anland RDP server initialized");
         // Keep the backends alive for the server's lifetime (the bridge task
