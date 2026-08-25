@@ -168,8 +168,11 @@ impl AnlandRdpServer {
         rdp_server.set_honor_client_desktop_size(false);
 
         // Spawn the video pump: pulls encoded frames from the platform source
-        // and ships them over EGFX AVC420.
+        // and ships them over EGFX AVC420. It also consumes the bridge's
+        // video-discontinuity flag (Android reconnect / bad frame) to recover
+        // with a fresh keyframe.
         if let Some(source) = video_source {
+            let bridge_discontinuity = backends.video_discontinuity().clone();
             spawn_video_pump(
                 source,
                 latest_handle,
@@ -177,6 +180,7 @@ impl AnlandRdpServer {
                 rdp_server.event_sender().clone(),
                 bridge_for_pump,
                 display_suppressed,
+                bridge_discontinuity,
                 config.width,
                 config.height,
                 shutdown.subscribe(),
