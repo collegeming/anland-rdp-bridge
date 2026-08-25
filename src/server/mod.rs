@@ -110,12 +110,16 @@ impl AnlandRdpServer {
         let (gfx_factory, latest_handle, gfx_state) = AnlandGfxFactory::new(bridge.clone());
         let video_source = backends.video_source();
 
-        // CLIPRDR text clipboard: bidirectional CF_UNICODETEXT between the
-        // Android clipboard (bridge watch) and mstsc.
+        // CLIPRDR text + image clipboard: bidirectional CF_UNICODETEXT /
+        // CF_DIB between the Android clipboard (bridge watches) and mstsc.
         let clipboard_rx = backends
             .take_clipboard_rx()
             .context("backends clipboard_rx already taken")?;
-        let cliprdr_factory = AnlandCliprdrFactory::new(bridge.clone(), clipboard_rx);
+        let clipboard_image_rx = backends
+            .take_clipboard_image_rx()
+            .context("backends clipboard_image_rx already taken")?;
+        let cliprdr_factory =
+            AnlandCliprdrFactory::new(bridge.clone(), clipboard_rx, clipboard_image_rx);
 
         // RDPSND audio: bridge audio chunks → the per-connection audio
         // sender; the factory holds the shared slot the pump writes into.

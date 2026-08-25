@@ -29,6 +29,9 @@ pub mod msg {
     pub const MOUSE_AXIS: u8 = 4;
     pub const CLIPBOARD_UPDATE: u8 = 5;
     pub const CLIPBOARD_ACK: u8 = 6;
+    /// An image (PNG bytes) added to the clipboard, separate from the text
+    /// channel — `sequence:u64 || png[]`.
+    pub const CLIPBOARD_IMAGE: u8 = 7;
     pub const VIDEO_FRAME: u8 = 16;
     pub const IDR_REQUEST: u8 = 17;
     pub const STREAM_START: u8 = 18;
@@ -207,6 +210,37 @@ pub fn decode_clipboard_ack(payload: &[u8]) -> Result<u64> {
     let sequence = u64::from_le_bytes(payload[0..8].try_into().unwrap());
     ensure!(sequence != 0, "anland bridge: clipboard ack sequence must be non-zero");
     Ok(sequence)
+}
+
+/// A decoded `CLIPBOARD_IMAGE` (message type 7) payload: a non-zero `u64`
+/// sequence plus PNG-encoded image bytes (non-empty).
+#[derive(Debug, Clone)]
+pub struct ClipboardImage {
+    pub sequence: u64,
+    pub png: Vec<u8>,
+}
+
+impl ClipboardImage {
+    pub const SEQ_LEN: usize = 8;
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        ensure!(
+            payload.len() >= Self::SEQ_LEN + 1,
+            "anland bridge: clipboard image too short"
+        );
+        let sequence = u64::from_le_bytes(payload[0..Self::SEQ_LEN].try_into().unwrap());
+        ensure!(sequence != 0, "anland bridge: clipboard image sequence must be non-zero");
+        let png = payload[Self::SEQ_LEN..].to_vec();
+        ensure!(!png.is_empty(), "anland bridge: clipboard image has empty payload");
+        Ok(Self { sequence, png })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::SEQ_LEN + self.png.len());
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&self.png);
+        out
+    }
 }
 
 /// Encode a `STREAM_START` payload: `visible_width:u16, visible_height:u16, fps:u8`.
@@ -399,5 +433,27 @@ mod tests {
         assert_eq!(pcm[6], audio_format::PCM16LE);
         let aac = encode_audio_start(48_000, 2, true);
         assert_eq!(aac[6], audio_format::AAC_LC);
+    }
+
+    #[test]
+    fn clipboard_image_round_trip() {
+        let img = ClipboardImage {
+            sequence: 3,
+            png: b"\x89PNG\r\n\x1a\nfake-png".to_vec(),
+        };
+        let decoded = ClipboardImage::decode(&img.encode()).unwrap();
+        assert_eq!(decoded.sequence, 3);
+        assert_eq!(decoded.png, img.png);
+    }
+
+    #[test]
+    fn clipboard_image_rejects_zero_seq_and_empty() {
+        let mut zero_seq = Vec::new();
+        zero_seq.extend_from_slice(&0u64.to_le_bytes());
+        zero_seq.extend_from_slice(b"png");
+        assert!(ClipboardImage::decode(&zero_seq).is_err());
+
+        let empty = vec![0u8; ClipboardImage::SEQ_LEN];
+        assert!(ClipboardImage::decode(&empty).is_err());
     }
 }

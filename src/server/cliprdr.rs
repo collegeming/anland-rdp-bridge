@@ -1,26 +1,31 @@
-//! CLIPRDR text clipboard: bidirectional text sync between the Android
-//! clipboard (over the anland bridge) and `mstsc`'s CF_UNICODETEXT.
-//!
-//! Image (CF_DIB) and file (FileGroupDescriptorW / FileContentsRequest) are
-//! NOT wired here — the bridge wire protocol's `CLIPBOARD_UPDATE` is text-
-//! only (strict UTF-8, 1 MiB). Extending the wire for image/file is a
-//! follow-up. File/image requests from the client return CB_RESPONSE_FAIL
-//! rather than hanging.
+//! CLIPRDR clipboard: bidirectional text (CF_UNICODETEXT) + image (CF_DIB)
+//! sync between the Android clipboard (over the anland bridge) and `mstsc`.
 //!
 //! ## Data flow
 //!
-//! - Android → mstsc: the bridge publishes the latest text on a
-//!   `watch::Receiver<Option<String>>`. `on_ready` / `on_request_format_list`
-//!   advertise CF_UNICODETEXT; `on_format_data_request` responds with the
-//!   current text.
-//! - mstsc → Android: `on_format_data_response` for CF_UNICODETEXT forwards
-//!   the text to Android via `AnlandBridge::send_clipboard(seq, text)`.
+//! - Android → mstsc: the bridge publishes the latest text on
+//!   `watch::Receiver<Option<String>>` and the latest image (PNG bytes) on
+//!   `watch::Receiver<Option<Vec<u8>>>`. `on_ready` / `on_request_format_list`
+//!   advertise CF_UNICODETEXT (always) + CF_DIB (when an image is present);
+//!   `on_format_data_request` responds with the current text or a PNG→DIB
+//!   conversion of the current image.
+//! - mstsc → Android: `on_remote_copy` requests the client's text or image;
+//!   `on_format_data_response` forwards the text via
+//!   `AnlandBridge::send_clipboard(seq, text)` or converts the DIB→PNG and
+//!   forwards via `AnlandBridge::send_clipboard_image(seq, png)`.
+//!
+//! File (FileGroupDescriptorW / FileContentsRequest) is NOT wired — it needs
+//! the anland-side file provider contract (a follow-up wire extension).
 //!
 //! `ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy / SendFormatData)`
-//! is the outbound path to the RDP CLIPRDR SVC.
+//! is the outbound path to the RDP CLIPRDR SVC. The PNG↔DIB conversions are
+//! adapted from macrdp (MIT OR Apache-2.0, part of this fork's lineage).
 
+use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::{anyhow, bail, Context, Result};
+use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FormatDataRequest,
@@ -33,25 +38,33 @@ use tracing::{debug, info, warn};
 
 use crate::anland_bridge::AnlandBridge;
 
-/// CF_UNICODETEXT format id (the Windows clipboard constant).
+/// CF_UNICODETEXT (13) and CF_DIB (8) — the Windows clipboard constants.
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIB: u32 = 8;
 
 /// Anland CLIPRDR factory: clones the bridge handle + the Android clipboard
-/// watch receiver per connection.
+/// text/image watch receivers per connection.
 #[derive(Clone)]
 pub struct AnlandCliprdrFactory {
     bridge: AnlandBridge,
     /// Latest Android clipboard text (cloned per-connection backend).
     clipboard_rx: watch::Receiver<Option<String>>,
+    /// Latest Android clipboard image, PNG bytes (cloned per-connection).
+    clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
     /// Monotonic sequence for mstsc→Android updates (must be non-zero).
     next_seq: std::sync::Arc<AtomicU64>,
 }
 
 impl AnlandCliprdrFactory {
-    pub fn new(bridge: AnlandBridge, clipboard_rx: watch::Receiver<Option<String>>) -> Self {
+    pub fn new(
+        bridge: AnlandBridge,
+        clipboard_rx: watch::Receiver<Option<String>>,
+        clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
+    ) -> Self {
         Self {
             bridge,
             clipboard_rx,
+            clipboard_image_rx,
             next_seq: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -69,8 +82,9 @@ impl CliprdrBackendFactory for AnlandCliprdrFactory {
             bridge: self.bridge.clone(),
             sender: None,
             clipboard_rx: self.clipboard_rx.clone(),
+            clipboard_image_rx: self.clipboard_image_rx.clone(),
             next_seq: std::sync::Arc::clone(&self.next_seq),
-            advertised: false,
+            pending_request: None,
         })
     }
 }
@@ -83,37 +97,45 @@ pub struct AnlandCliprdrBackend {
     /// Outbound RDP event sender; set by the server after construction.
     sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     clipboard_rx: watch::Receiver<Option<String>>,
+    clipboard_image_rx: watch::Receiver<Option<Vec<u8>>>,
     next_seq: std::sync::Arc<AtomicU64>,
-    /// Whether we have already advertised our (single) format list this
-    /// connection.
-    advertised: bool,
+    /// Which format we last asked the client for; `on_format_data_response`
+    /// routes on this (the response carries no format id).
+    pending_request: Option<ClipboardFormatId>,
 }
 
 impl std::fmt::Debug for AnlandCliprdrBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnlandCliprdrBackend")
-            .field("advertised", &self.advertised)
+            .field("pending_request", &self.pending_request)
             .finish_non_exhaustive()
     }
 }
 
 impl AnlandCliprdrBackend {
+    /// Advertise CF_UNICODETEXT (always) + CF_DIB (when an image is present).
     fn advertise(&mut self) {
         if let Some(sender) = &self.sender {
-            // CF_UNICODETEXT is a standard registered format (id 13); no
-            // long-format name is required.
-            let format = ClipboardFormat::new(ClipboardFormatId::new(CF_UNICODETEXT));
+            let mut formats = vec![ClipboardFormat::new(ClipboardFormatId::new(CF_UNICODETEXT))];
+            if self.current_image().is_some() {
+                formats.push(ClipboardFormat::new(ClipboardFormatId::new(CF_DIB)));
+            }
+            let count = formats.len();
             let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-                vec![format],
+                formats,
             )));
-            self.advertised = true;
-            debug!("anland cliprdr: advertised CF_UNICODETEXT");
+            debug!("anland cliprdr: advertised {count} format(s)");
         }
     }
 
     /// Current Android clipboard text (cloned from the watch).
     fn current_text(&self) -> String {
         self.clipboard_rx.borrow().clone().unwrap_or_default()
+    }
+
+    /// Current Android clipboard image (PNG bytes), if any.
+    fn current_image(&self) -> Option<Vec<u8>> {
+        self.clipboard_image_rx.borrow().clone()
     }
 }
 
@@ -123,18 +145,15 @@ impl CliprdrBackend for AnlandCliprdrBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        // Text-only: no file/object capabilities.
+        // Text + image only: no file/object capabilities.
         ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
     }
 
     fn on_ready(&mut self) {
-        // Advertise CF_UNICODETEXT once the CLIPRDR channel is up.
         self.advertise();
     }
 
     fn on_request_format_list(&mut self) {
-        // Client asked us to (re-)send our format list.
-        self.advertised = false;
         self.advertise();
     }
 
@@ -147,55 +166,90 @@ impl CliprdrBackend for AnlandCliprdrBackend {
     }
 
     fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {
-        // Accept whatever the client offered; text-only on our side.
+        // Accept whatever the client offered; text+image on our side.
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        // mstsc copied something. If CF_UNICODETEXT is among the offered
-        // formats, request it; otherwise ignore (image/file not supported).
-        let wants_text = available_formats.iter().any(|f| f.id().0 == CF_UNICODETEXT);
-        if wants_text {
-            if let Some(sender) = &self.sender {
-                let _ = sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(CF_UNICODETEXT)),
-                ));
-                debug!("anland cliprdr: requesting CF_UNICODETEXT from client");
-            }
+        // mstsc copied something. Prefer the image (CF_DIB) if offered, else
+        // text (CF_UNICODETEXT); ignore otherwise.
+        let has_image = available_formats.iter().any(|f| f.id().0 == CF_DIB);
+        let has_text = available_formats.iter().any(|f| f.id().0 == CF_UNICODETEXT);
+        let (id, name) = if has_image {
+            (CF_DIB, "CF_DIB")
+        } else if has_text {
+            (CF_UNICODETEXT, "CF_UNICODETEXT")
         } else {
-            debug!("anland cliprdr: client copy has no text format; ignoring");
+            debug!("anland cliprdr: client copy has neither text nor image; ignoring");
+            return;
+        };
+        self.pending_request = Some(ClipboardFormatId::new(id));
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(id)),
+            ));
+            debug!("anland cliprdr: requesting {name} from client");
         }
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        // mstsc wants our clipboard in `request.format`. Respond with the
-        // current Android text if it's CF_UNICODETEXT; fail otherwise (image/
-        // file unsupported here).
-        if request.format.0 != CF_UNICODETEXT {
-            warn!(
-                id = request.format.0,
-                "anland cliprdr: format data request for non-text format; failing"
-            );
-            return;
-        }
-        let text = self.current_text();
+        // mstsc wants our clipboard in `request.format`.
+        let response = match request.format.0 {
+            CF_UNICODETEXT => {
+                let text = self.current_text();
+                OwnedFormatDataResponse::new_unicode_string(&text)
+            }
+            CF_DIB => match self.current_image() {
+                Some(png) => match png_to_dib(&png) {
+                    Ok(dib) => OwnedFormatDataResponse::new_data(dib),
+                    Err(e) => {
+                        warn!("anland cliprdr: PNG→DIB failed: {e:#}");
+                        return;
+                    }
+                },
+                None => {
+                    debug!("anland cliprdr: CF_DIB requested but no image present");
+                    return;
+                }
+            },
+            id => {
+                warn!(id, "anland cliprdr: format data request for unsupported format");
+                return;
+            }
+        };
         if let Some(sender) = &self.sender {
-            let response = OwnedFormatDataResponse::new_unicode_string(&text);
             let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendFormatData(response)));
-            debug!(bytes = text.len(), "anland cliprdr: sent CF_UNICODETEXT to client");
+            debug!("anland cliprdr: sent clipboard data to client");
         }
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-        // mstsc delivered its clipboard text. Decode UTF-16LE and forward to
-        // Android via the bridge with the next sequence number.
-        let text = decode_utf16(response.data());
+        // Route on what we last asked for; the response carries no format id.
+        let Some(requested) = self.pending_request.take() else {
+            debug!("anland cliprdr: unsolicited format data response; ignoring");
+            return;
+        };
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        self.bridge.send_clipboard(seq, text);
-        info!("anland cliprdr: forwarded client clipboard to Android (seq {seq})");
+        match requested.0 {
+            CF_UNICODETEXT => {
+                let text = decode_utf16(response.data());
+                self.bridge.send_clipboard(seq, text);
+                info!("anland cliprdr: forwarded client text to Android (seq {seq})");
+            }
+            CF_DIB => match dib_to_png(response.data()) {
+                Ok(png) => {
+                    self.bridge.send_clipboard_image(seq, png);
+                    info!("anland cliprdr: forwarded client image to Android (seq {seq})");
+                }
+                Err(e) => {
+                    warn!("anland cliprdr: DIB→PNG failed: {e:#}");
+                }
+            },
+            _ => debug!("anland cliprdr: response for unsupported format; ignoring"),
+        }
     }
 
     fn on_file_contents_request(&mut self, _request: ironrdp_cliprdr::pdu::FileContentsRequest) {
-        // File copy is not supported over the text-only bridge yet.
+        // File copy is not supported yet (bridge wire extension pending).
         debug!("anland cliprdr: file contents request (unsupported); ignoring");
     }
 
@@ -204,7 +258,7 @@ impl CliprdrBackend for AnlandCliprdrBackend {
     }
 
     fn on_lock(&mut self, _data_id: LockDataId) {
-        // Lock/unlock of clipboard data IDs is not used for text-only sync.
+        // Lock/unlock of clipboard data IDs is not used for text+image sync.
     }
 
     fn on_unlock(&mut self, _data_id: LockDataId) {}
@@ -238,4 +292,183 @@ fn decode_utf16(bytes: &[u8]) -> String {
         units.pop();
     }
     String::from_utf16_lossy(&units)
+}
+
+/// Convert PNG bytes to a CF_DIB payload: a 40-byte BITMAPINFOHEADER followed
+/// by 32bpp BGRA pixels, top-down (negative biHeight). 32bpp is the most
+/// widely supported variant; BITMAPV5HEADER is deliberately not emitted since
+/// it complicates color-space negotiation with older clients.
+fn png_to_dib(png: &[u8]) -> Result<Vec<u8>> {
+    let img = ImageReader::new(Cursor::new(png))
+        .with_guessed_format()
+        .context("guess PNG format")?
+        .decode()
+        .context("decode PNG")?
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let row_bytes = (w as usize) * 4;
+    let pixel_bytes = row_bytes * (h as usize);
+
+    let mut out = Vec::with_capacity(40 + pixel_bytes);
+    out.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+    out.extend_from_slice(&(-(h as i32)).to_le_bytes()); // biHeight (negative = top-down)
+    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+    out.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+    // RGBA → BGRA, row order already top-down.
+    for px in img.pixels() {
+        let [r, g, b, a] = px.0;
+        out.extend_from_slice(&[b, g, r, a]);
+    }
+    Ok(out)
+}
+
+/// Parse a CF_DIB payload into PNG bytes. Accepts any header ≥ 40
+/// (BITMAPINFOHEADER), 24bpp or 32bpp uncompressed (BI_RGB), top-down or
+/// bottom-up. Everything else is rejected.
+fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
+    if dib.len() < 40 {
+        bail!("DIB shorter than BITMAPINFOHEADER");
+    }
+    let bi_size = u32::from_le_bytes(dib[0..4].try_into().unwrap()) as usize;
+    if bi_size < 40 || bi_size > dib.len() {
+        bail!("bogus biSize {bi_size}");
+    }
+    let width = i32::from_le_bytes(dib[4..8].try_into().unwrap());
+    let height_signed = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+    let bit_count = u16::from_le_bytes(dib[14..16].try_into().unwrap());
+    let compression = u32::from_le_bytes(dib[16..20].try_into().unwrap());
+
+    if width <= 0 {
+        bail!("invalid width {width}");
+    }
+    if height_signed == 0 {
+        bail!("invalid height 0");
+    }
+    // BI_RGB (0) canonical layout; BI_BITFIELDS (3) / BI_ALPHABITFIELDS (6)
+    // accepted for 32bpp under the standard ARGB masks modern Windows emits.
+    let bitfields = compression == 3 || compression == 6;
+    if compression != 0 && !bitfields {
+        bail!("unsupported BI_COMPRESSION {compression}");
+    }
+    if bit_count != 24 && bit_count != 32 {
+        bail!("unsupported biBitCount {bit_count}");
+    }
+    if bitfields && bit_count != 32 {
+        bail!("BI_BITFIELDS with biBitCount={bit_count} not supported");
+    }
+
+    let w = width as u32;
+    let h = height_signed.unsigned_abs();
+    let top_down = height_signed < 0;
+    let bpp = (bit_count / 8) as usize;
+    // BMP rows are padded to a 4-byte multiple.
+    let stride = (w as usize * bpp + 3) & !3;
+    // Out-of-band masks after a 40-byte header with BI_BITFIELDS.
+    let mask_bytes = if bitfields && bi_size == 40 {
+        if compression == 6 {
+            16 // RGBA masks
+        } else {
+            12 // RGB masks
+        }
+    } else {
+        0
+    };
+    let pixel_start = bi_size + mask_bytes;
+    let need = pixel_start
+        .checked_add(stride.checked_mul(h as usize).ok_or_else(|| anyhow!("overflow"))?)
+        .ok_or_else(|| anyhow!("overflow"))?;
+    if dib.len() < need {
+        bail!("DIB payload truncated: have {}, need {need}", dib.len());
+    }
+
+    let cap = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow!("RGBA buffer size overflow"))?;
+    let mut rgba: Vec<u8> = Vec::with_capacity(cap);
+    for row in 0..h {
+        let src_row = if top_down { row } else { h - 1 - row };
+        let row_off = pixel_start + (src_row as usize) * stride;
+        let row_bytes = &dib[row_off..row_off + w as usize * bpp];
+        for chunk in row_bytes.chunks_exact(bpp) {
+            let (b, g, r, a) = if bpp == 4 {
+                (chunk[0], chunk[1], chunk[2], chunk[3])
+            } else {
+                (chunk[0], chunk[1], chunk[2], 0xFF)
+            };
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)?;
+    Ok(png)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tiny 2×1 RGBA PNG: two opaque red pixels.
+    fn red_png() -> Vec<u8> {
+        let mut png = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder
+            .write_image(
+                &[255, 0, 0, 255, 255, 0, 0, 255],
+                2,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        png
+    }
+
+    #[test]
+    fn png_to_dib_produces_bgra_top_down() {
+        let dib = png_to_dib(&red_png()).unwrap();
+        assert!(dib.len() >= 40 + 8);
+        // BITMAPINFOHEADER: biSize=40, width=2, height=-1 (top-down), 32bpp.
+        assert_eq!(&dib[0..4], &40u32.to_le_bytes());
+        assert_eq!(&dib[4..8], &2i32.to_le_bytes());
+        assert_eq!(&dib[8..12], &(-1i32).to_le_bytes());
+        assert_eq!(&dib[14..16], &32u16.to_le_bytes());
+        // Pixels are BGRA: red = [0, 0, 255, 255].
+        assert_eq!(&dib[40..44], &[0, 0, 255, 255]);
+        assert_eq!(&dib[44..48], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn dib_to_png_round_trips() {
+        let png = red_png();
+        let dib = png_to_dib(&png).unwrap();
+        let back = dib_to_png(&dib).unwrap();
+        // Re-decode the PNG to check the pixels survive.
+        let img = ImageReader::new(Cursor::new(&back))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!((img.width(), img.height()), (2, 1));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dib_to_png_rejects_garbage() {
+        assert!(dib_to_png(&[0u8; 10]).is_err());
+        let mut bad = vec![0u8; 40];
+        bad[14..16].copy_from_slice(&64u16.to_le_bytes()); // biBitCount=64
+        assert!(dib_to_png(&bad).is_err());
+    }
 }
