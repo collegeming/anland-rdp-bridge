@@ -146,6 +146,10 @@ pub fn spawn_audio_pump(
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut paused = false;
+        // Bootstrap the capture backend once at pump start — the
+        // paused/resume path only calls start() on a transition, so without
+        // this the engine never boots on a quiet first session.
+        audio_source.start();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
