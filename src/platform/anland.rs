@@ -1,8 +1,9 @@
 //! anland / Linux / Android platform backends.
 //!
 //! These backends source frames/audio/clipboard/input from Android
-//! `MediaCodec` / `AudioRecord` / clipboard manager / native input, reached
-//! over the private anland Unix-socket bridge ([`crate::anland_bridge`]).
+//! `MediaCodec` / PipeWire / clipboard manager / native input, reached
+//! over the private anland Unix-socket bridge ([`crate::anland_bridge`]) and
+//! the local PipeWire sound service.
 //!
 //! ## Current wiring
 //!
@@ -10,16 +11,19 @@
 //!   already-encoded H.264 Annex-B frames from `AnlandBridgeInbound` and maps
 //!   them to [`EncodedVideoFrame`] for the EGFX ship side; `start`/`stop`/
 //!   `request_keyframe` forward to the [`AnlandBridge`] control surface.
-//! - `AudioSource` returns `None` for now — Android `AudioRecord` + optional
-//!   `MediaCodec` AAC is the next phase (it taps audio directly, not over the
-//!   video bridge).
+//! - [`AnlandAudioSource`] is **fully wired** to PipeWire via the C capture
+//!   shim (`native/anland_rdp_audio.c`, compiled by `build.rs`). It owns a
+//!   virtual `Audio/Sink` ("anland-rdp-speaker") and drains S16LE PCM at the
+//!   RDPSND-advertised 44.1 kHz / stereo so waves ship unchanged. No AAC path
+//!   yet.
 //! - Clipboard / input / drive redirection are NOT re-abstracted here; they
 //!   already implement upstream ironrdp traits and will be wired against the
 //!   Android clipboard manager / native input in the main.rs integration
 //!   phase.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -146,9 +150,7 @@ impl PlatformBackends for AnlandBackends {
     }
 
     fn audio_source(&mut self) -> Option<Box<dyn AudioSource + Send>> {
-        // Audio is tapped directly (Android AudioRecord + optional MediaCodec
-        // AAC), not over the video bridge. Wired in the audio phase.
-        None
+        Some(Box::new(AnlandAudioSource::new()))
     }
 
     fn display_info(&self) -> DisplayInfo {
@@ -206,20 +208,143 @@ impl VideoFrameSource for AnlandVideoSource {
     }
 }
 
-/// Audio source stub — Android `AudioRecord` (+ optional `MediaCodec` AAC) is
-/// wired in the audio phase. Kept here as a typed placeholder so the trait is
-/// satisfied once audio is added.
-#[allow(dead_code)]
-pub struct AnlandAudioSource;
+/// PipeWire desktop-audio source. Drains S16LE PCM (44.1 kHz / stereo) from
+/// the C capture shim (`native/anland_rdp_audio.c`) that owns the virtual
+/// "anland-rdp-speaker" sink, and emits [`AudioChunk::Pcm`] waves for the
+/// RDPSND pump. The rate matches the RDPSND-advertised format so no
+/// resampling is needed on the Rust side (PipeWire resamples from the hardware
+/// rate internally).
+///
+/// The C engine is process-global and idempotent to start; `stop`/`start`
+/// don't tear it down (the RDPSND pump already gates shipping on its `paused`
+/// flag, and rebuilding the PipeWire thread loop on every minimize/resume
+/// would cost ~1s of dead air). The capture ring keeps draining and drops
+/// oldest bytes on overflow while muted — harmless.
+pub struct AnlandAudioSource {
+    started: AtomicBool,
+    /// Monotonic PTS counter (ms), advanced by each shipped chunk's duration.
+    pts_ms: std::sync::Mutex<i64>,
+    origin: Instant,
+}
+
+extern "C" {
+    fn anland_rdp_audio_start(target: *const std::os::raw::c_char) -> std::os::raw::c_int;
+    fn anland_rdp_audio_pull(
+        buf: *mut std::ffi::c_void,
+        max_bytes: u32,
+        rate: *mut u32,
+        channels: *mut u32,
+    ) -> std::os::raw::c_int;
+    fn anland_rdp_audio_stop();
+}
+
+/// 20 ms of 44.1 kHz stereo S16 — the target pull size. Smaller than the
+/// ~1s ring so a backed-up pump drops old audio, not current; larger than a
+/// single PipeWire period so wave overhead stays low.
+const PULL_BYTES: usize = 44_100 * 2 * 2 * 20 / 1000;
+
+impl AnlandAudioSource {
+    pub fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            pts_ms: std::sync::Mutex::new(0),
+            origin: Instant::now(),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl AudioSource for AnlandAudioSource {
     async fn next_chunk(&mut self) -> anyhow::Result<Option<AudioChunk>> {
-        anyhow::bail!("anland audio source not wired yet — AudioRecord pending")
+        let mut buf = vec![0u8; PULL_BYTES];
+        loop {
+            let mut rate: u32 = 0;
+            let mut channels: u32 = 0;
+            // SAFETY: the C shim reads `buf`/`max_bytes` and writes up to
+            // `max_bytes` into `buf`; the out-params are valid pointers. Safe
+            // to call from any thread once started (mutex-protected inside).
+            let n = unsafe {
+                anland_rdp_audio_pull(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    PULL_BYTES as u32,
+                    &mut rate,
+                    &mut channels,
+                )
+            };
+            if n < 0 {
+                anyhow::bail!("anland audio: PipeWire shim not started");
+            }
+            if n > 0 {
+                buf.truncate(n as usize);
+                // Advance the monotonic PTS by this chunk's playback duration
+                // so waves are paced correctly even when the pull cadence
+                // drifts. ms = bytes / (rate * channels * 2) * 1000.
+                let dur_ms = if rate > 0 && channels > 0 {
+                    (n as i64) * 1000 / i64::from(rate) / i64::from(channels) / 2
+                } else {
+                    0
+                };
+                let pts = {
+                    let mut p = self.pts_ms.lock().expect("pts lock poisoned");
+                    let cur = *p;
+                    *p = cur.saturating_add(dur_ms);
+                    cur
+                };
+                // Prefer the shim's negotiated format; fall back to the
+                // advertised defaults if PipeWire hadn't reported yet.
+                let sample_rate = if rate > 0 { rate } else { 44_100 };
+                let ch = if channels > 0 {
+                    channels as u16
+                } else {
+                    2
+                };
+                return Ok(Some(AudioChunk::Pcm {
+                    samples: buf,
+                    sample_rate,
+                    channels: ch,
+                    pts_ms: pts,
+                }));
+            }
+            // Ring empty — back off briefly so the EGFX/video pump (which
+            // shares the select) isn't starved. Cancellable by the pump's
+            // shutdown select arm.
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            let _ = self.origin; // keep the field meaningful for future wall-clock pts
+        }
     }
+
     fn supports_aac(&self) -> bool {
         false
     }
-    fn start(&self) {}
-    fn stop(&self) {}
+
+    fn start(&self) {
+        if !self.started.swap(true, Ordering::SeqCst) {
+            // SAFETY: no-op if already started; first call bootstraps the
+            // PipeWire thread loop + virtual sink.
+            let rc = unsafe { anland_rdp_audio_start(std::ptr::null()) };
+            if rc != 0 {
+                // Clear so a later start() retries; the pump will keep pulling
+                // and bail on the shim's "not started" error.
+                self.started.store(false, Ordering::SeqCst);
+                tracing::warn!("anland audio: PipeWire shim start failed (rc={rc})");
+            }
+        }
+    }
+
+    fn stop(&self) {
+        // Intentionally a no-op on the C engine: the RDPSND pump already
+        // mutes shipping via its `paused` flag, and tearing down/rebuilding
+        // the PipeWire thread loop on every SuppressOutput would cost ~1s of
+        // dead air on resume. The capture ring keeps draining and drops oldest
+        // bytes on overflow while muted — harmless and resume is instant.
+    }
+}
+
+impl Drop for AnlandAudioSource {
+    fn drop(&mut self) {
+        if self.started.swap(false, Ordering::SeqCst) {
+            // SAFETY: idempotent teardown; joins the PipeWire thread loop.
+            unsafe { anland_rdp_audio_stop() };
+        }
+    }
 }
