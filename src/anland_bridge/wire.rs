@@ -31,7 +31,10 @@ pub mod msg {
     pub const CLIPBOARD_ACK: u8 = 6;
     /// An image (PNG bytes) added to the clipboard, separate from the text
     /// channel — `sequence:u64 || png[]`.
-    pub const CLIPBOARD_IMAGE: u8 = 7;
+    ///
+    /// NOTE: 7 is the Android consumer's `INPUT_RESET` (a legacy message not
+    /// in the lamco spec); the image message is 8 to avoid a wire collision.
+    pub const CLIPBOARD_IMAGE: u8 = 8;
     pub const VIDEO_FRAME: u8 = 16;
     pub const IDR_REQUEST: u8 = 17;
     pub const STREAM_START: u8 = 18;
