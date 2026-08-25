@@ -25,6 +25,9 @@
 //!
 //! BTN_LEFT=272, BTN_RIGHT=273, BTN_MIDDLE=274, BTN_SIDE=275, BTN_EXTRA=276.
 
+/// anland RDP server module.
+pub mod gfx;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -42,7 +45,8 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use crate::anland_bridge::{transport::BridgeEndpoint, AnlandBridge};
-use crate::platform::AnlandBackends;
+use crate::platform::{AnlandBackends, PlatformBackends};
+use crate::server::gfx::{spawn_video_pump, AnlandGfxFactory};
 
 /// Linux evdev button codes carried on the bridge `MOUSE_BUTTON` payload.
 mod evdev {
@@ -95,10 +99,20 @@ impl AnlandRdpServer {
         // `with_hybrid` + credentials in a follow-up.
         let tls_acceptor = build_tls_acceptor(&config.cert_path, &config.key_path)?;
 
+        // EGFX AVC420 video pump: factory (per-connection handler + server
+        // handle) + the platform video source (already-encoded MediaCodec
+        // frames over the bridge). The factory holds a bridge clone for
+        // start/stop; latest_handle + state are shared with the pump.
+        let (gfx_factory, latest_handle, gfx_state) = AnlandGfxFactory::new(bridge.clone());
+        let video_source = backends.video_source();
+
         let display = FixedDisplay {
             width: config.width,
             height: config.height,
         };
+        // Clone the bridge for the video pump before moving it into the input
+        // handler (which forwards keyboard/mouse through it).
+        let bridge_for_pump = bridge.clone();
         let input = AnlandInputHandler { bridge };
 
         let mut rdp_server = RdpServer::builder()
@@ -109,17 +123,34 @@ impl AnlandRdpServer {
             .with_cliprdr_factory(None)
             .with_sound_factory(None)
             .with_rdpdr_factory(None)
-            .with_gfx_factory(None)
+            .with_gfx_factory(Some(Box::new(gfx_factory)))
             .with_usb_factory(None)
             .with_camera_factory(None)
             .with_connection_handler(None)
             .build();
 
         // Share the SuppressOutput flag with the bridge so a minimized mstsc
-        // pauses the Android encoder via the backends' display-suppression
-        // path (wired when the EGFX video pump is added).
+        // pauses the Android encoder via the video pump's suppression path.
         rdp_server.set_display_suppressed_handle(Arc::clone(&display_suppressed));
         rdp_server.set_honor_client_desktop_size(false);
+
+        // Spawn the video pump: pulls encoded frames from the platform source
+        // and ships them over EGFX AVC420.
+        if let Some(source) = video_source {
+            spawn_video_pump(
+                source,
+                latest_handle,
+                gfx_state,
+                rdp_server.event_sender().clone(),
+                bridge_for_pump,
+                display_suppressed,
+                config.width,
+                config.height,
+                shutdown.subscribe(),
+            );
+        } else {
+            warn!("anland RDP server: no video source from backends; EGFX pump not started");
+        }
 
         info!(addr = %config.listen_addr, "anland RDP server initialized");
         // Keep the backends alive for the server's lifetime (the bridge task
