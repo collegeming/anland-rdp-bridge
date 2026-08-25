@@ -1,8 +1,7 @@
 # Clipboard file transfer — wire extension + CLIPRDR backend design
 
-Status: **protocol layer implemented** (wire messages + bridge plumbing + unit
-tests). The CLIPRDR backend serving (`FileGroupDescriptorW` / `FileContentsRequest`)
-and the Android-side provider are the remaining implementation.
+Status: **implemented server-side** (wire messages + bridge plumbing + CLIPRDR
+backend). The Android-side provider is the remaining implementation.
 
 ## Why this is harder than text/image
 
@@ -37,26 +36,25 @@ backend is the next step.
 ## CLIPRDR backend design (next step)
 
 The sync `CliprdrBackend` callback must bridge to the async file-content
-channel. Proposal (mirrors macrdp's Mac→Windows-only file path, re-pointed at
-Android):
+channel. Implemented as follows:
 
-- **Advertise** `FileGroupDescriptorW` (0xC004) when the file-list watch is
-  non-empty (like `CF_DIB`).
-- **`on_format_data_request`** for `FileGroupDescriptorW`: build the
-  `FileDescriptor[]` from the watch entries (name + size), reply with
-  `OwnedFormatDataResponse::new_file_list(...)`.
-- **`on_file_contents_request`**: spawn a background task that owns a clone of
-  the file-content receiver and the RDP event sender. The task:
-  1. sends `FILE_CONTENT_REQUEST` via `AnlandBridge::request_file_content`;
-  2. awaits the matching `FILE_CONTENT_RESPONSE` (by `request_id`) on
-     `file_content_rx`;
-  3. replies with `ClipboardMessage::SendFileContentsResponse` (SIZE →
-     `new_size_response`, RANGE → `new_data_response`).
-  The receiver must be shared across concurrent requests — either
-  `Arc<tokio::sync::Mutex<mpsc::Receiver<_>>>` (single outstanding request at a
-  time is the normal case) or a per-request oneshot. Direction: **Android →
-  Windows only** (copy a file on Android → paste into mstsc), matching macrdp's
-  Mac→Windows-only model.
+- **Advertise** `ClipboardFileCopy(Vec<FileDescriptor>)` (the vendored
+  `ServerEvent::ClipboardFileCopy` variant) when the file-list watch is
+  non-empty — this populates the cliprdr server's `local_file_list`, which is
+  what makes `FileContentsRequest`s be serviced instead of short-circuiting
+  with `CB_RESPONSE_FAIL`. `client_capabilities` advertises
+  `STREAM_FILECLIP_ENABLED` (required for file paste).
+- **SIZE** (`FileContentsFlags::SIZE`): answered **synchronously** from the
+  file-list watch — the size is already known, no bridge round-trip.
+- **RANGE** (`FileContentsFlags::RANGE`): spawns a background task that
+  (1) sends `FILE_CONTENT_REQUEST` via `AnlandBridge::request_file_content`
+  with `request_id = stream_id`; (2) awaits the matching
+  `FILE_CONTENT_RESPONSE` on the shared `Arc<Mutex<mpsc::Receiver<_>>>` (a 5 s
+  timeout guards a vanished Android side); (3) replies with
+  `ClipboardMessage::SendFileContentsResponse` (`new_data_response`, or
+  `new_error` on empty/EOF).
+- Direction: **Android → Windows only** (copy a file on Android → paste into
+  mstsc), mirroring macrdp's Mac→Windows-only model.
 
 ## Android-side contract (to implement in the consumer)
 

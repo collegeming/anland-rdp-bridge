@@ -118,8 +118,19 @@ impl AnlandRdpServer {
         let clipboard_image_rx = backends
             .take_clipboard_image_rx()
             .context("backends clipboard_image_rx already taken")?;
-        let cliprdr_factory =
-            AnlandCliprdrFactory::new(bridge.clone(), clipboard_rx, clipboard_image_rx);
+        let file_list_rx = backends
+            .take_file_list_rx()
+            .context("backends file_list_rx already taken")?;
+        let file_content_rx = backends
+            .take_file_content_rx()
+            .context("backends file_content_rx already taken")?;
+        let cliprdr_factory = AnlandCliprdrFactory::new(
+            bridge.clone(),
+            clipboard_rx,
+            clipboard_image_rx,
+            file_list_rx,
+            file_content_rx,
+        );
 
         // RDPSND audio: bridge audio chunks → the per-connection audio
         // sender; the factory holds the shared slot the pump writes into.
