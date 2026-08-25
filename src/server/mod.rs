@@ -205,10 +205,7 @@ fn build_tls_acceptor(cert_path: &std::path::Path, key_path: &std::path::Path) -
         .with_context(|| format!("read key {}", key_path.display()))?;
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("parse cert PEM: {e}"))?
-        .into_iter()
-        .map(CertificateDer::from)
-        .collect();
+        .map_err(|e| anyhow::anyhow!("parse cert PEM: {e}"))?;
     let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
         .map_err(|e| anyhow::anyhow!("parse key PEM: {e}"))?
         .context("no private key in PEM")?;
