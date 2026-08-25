@@ -133,19 +133,22 @@ impl AnlandRdpServer {
         );
 
         // RDPSND audio: bridge audio chunks → the per-connection audio
-        // sender; the factory holds the shared slot the pump writes into.
+        // sender; the factory holds the shared slot the pump writes into plus
+        // the last negotiated format for mute/resume.
         let audio_rx = backends
             .take_audio_rx()
             .context("backends audio_rx already taken")?;
-        let (rdpsnd_factory, latest_audio_sender) = AnlandRdpsndFactory::new(bridge.clone());
+        let (rdpsnd_factory, latest_audio_sender, audio_last_format) =
+            AnlandRdpsndFactory::new(bridge.clone());
 
         let display = FixedDisplay {
             width: config.width,
             height: config.height,
         };
-        // Clone the bridge for the video pump before moving it into the input
-        // handler (which forwards keyboard/mouse through it).
+        // Clone the bridge for the video/audio pumps before moving it into
+        // the input handler (which forwards keyboard/mouse through it).
         let bridge_for_pump = bridge.clone();
+        let bridge_for_audio = bridge.clone();
         let input = AnlandInputHandler { bridge };
 
         let mut rdp_server = RdpServer::builder()
@@ -179,7 +182,7 @@ impl AnlandRdpServer {
                 gfx_state,
                 rdp_server.event_sender().clone(),
                 bridge_for_pump,
-                display_suppressed,
+                display_suppressed.clone(),
                 bridge_discontinuity,
                 config.width,
                 config.height,
@@ -190,8 +193,15 @@ impl AnlandRdpServer {
         }
 
         // Spawn the audio pump: forwards Android audio chunks to the RDPSND
-        // sender for the current connection.
-        spawn_audio_pump(audio_rx, latest_audio_sender, shutdown.subscribe());
+        // sender for the current connection; mutes on display suppression.
+        spawn_audio_pump(
+            audio_rx,
+            latest_audio_sender,
+            bridge_for_audio,
+            display_suppressed.clone(),
+            audio_last_format,
+            shutdown.subscribe(),
+        );
 
         info!(addr = %config.listen_addr, "anland RDP server initialized");
         // Keep the backends alive for the server's lifetime (the bridge task

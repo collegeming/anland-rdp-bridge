@@ -18,7 +18,9 @@
 //! not yet advertised — the Android `MediaCodec` AAC encoder backend is a
 //! follow-up. `choose_format` prefers AAC when it is present.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
@@ -36,21 +38,32 @@ const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
 /// RDPSND factory: builds a per-connection backend and holds the shared
-/// audio-sender slot the pump writes into.
+/// audio-sender slot + last-negotiated-format cell the pump reads.
 pub struct AnlandRdpsndFactory {
     bridge: AnlandBridge,
     /// Latest RDPSND audio sender, set per connection; the pump reads it.
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
+    /// Last negotiated capture format `(sample_rate, channels, aac)`; the pump
+    /// uses it to restart Android capture after display-suppression.
+    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
 }
 
 impl AnlandRdpsndFactory {
-    pub fn new(bridge: AnlandBridge) -> (Self, Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>) {
+    pub fn new(
+        bridge: AnlandBridge,
+    ) -> (
+        Self,
+        Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
+        Arc<Mutex<Option<(u32, u16, bool)>>>,
+    ) {
         let latest_audio_sender = Arc::new(Mutex::new(None));
+        let last_format = Arc::new(Mutex::new(None));
         let factory = Self {
             bridge,
             latest_audio_sender: Arc::clone(&latest_audio_sender),
+            last_format: Arc::clone(&last_format),
         };
-        (factory, latest_audio_sender)
+        (factory, latest_audio_sender, last_format)
     }
 }
 
@@ -66,6 +79,7 @@ impl SoundServerFactory for AnlandRdpsndFactory {
         Box::new(AnlandRdpsndBackend {
             bridge: self.bridge.clone(),
             latest_audio_sender: Arc::clone(&self.latest_audio_sender),
+            last_format: Arc::clone(&self.last_format),
         })
     }
 
@@ -80,6 +94,7 @@ impl SoundServerFactory for AnlandRdpsndFactory {
 pub struct AnlandRdpsndBackend {
     bridge: AnlandBridge,
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
+    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
 }
 
 impl std::fmt::Debug for AnlandRdpsndBackend {
@@ -124,30 +139,54 @@ impl RdpsndServerHandler for AnlandRdpsndBackend {
             use_aac,
             sample_rate, channels, "anland rdpsnd: audio streaming starting"
         );
+        if let Ok(mut slot) = self.last_format.lock() {
+            *slot = Some((sample_rate, channels, use_aac));
+        }
         self.bridge.start_audio(sample_rate, channels, use_aac);
         Ok(())
     }
 
     fn stop(&mut self) {
         debug!("anland rdpsnd: audio streaming stopped");
+        if let Ok(mut slot) = self.last_format.lock() {
+            *slot = None;
+        }
         self.bridge.stop_audio();
     }
 }
 
 /// Spawn the audio pump: forward Android audio chunks to the current RDPSND
-/// sender. Idles when Android is not capturing; ends on shutdown or when the
+/// sender. Idles when Android is not capturing; mutes on display suppression
+/// (client minimized) by telling Android to stop; ends on shutdown or when the
 /// bridge disconnects.
 pub fn spawn_audio_pump(
     mut audio_rx: mpsc::Receiver<AudioWireChunk>,
     latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
+    bridge: AnlandBridge,
+    display_suppressed: Arc<AtomicBool>,
+    last_format: Arc<Mutex<Option<(u32, u16, bool)>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
+        let mut poll = tokio::time::interval(Duration::from_millis(500));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut paused = false;
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                _ = poll.tick() => {
+                    update_audio_suppression(
+                        &bridge, &display_suppressed, &last_format, &mut paused,
+                    );
+                }
                 chunk = audio_rx.recv() => {
                     let Some(chunk) = chunk else { break };
+                    update_audio_suppression(
+                        &bridge, &display_suppressed, &last_format, &mut paused,
+                    );
+                    if paused || display_suppressed.load(Ordering::Acquire) {
+                        continue; // muted while minimized
+                    }
                     let wave = make_wave(&chunk);
                     let sender = match latest_audio_sender.lock() {
                         Ok(g) => g.clone(),
@@ -164,6 +203,33 @@ pub fn spawn_audio_pump(
         }
         info!("anland rdpsnd: audio pump stopped");
     });
+}
+
+/// Stop Android capture after display suppression; restart it (with the last
+/// negotiated format) on resume.
+fn update_audio_suppression(
+    bridge: &AnlandBridge,
+    display_suppressed: &AtomicBool,
+    last_format: &Mutex<Option<(u32, u16, bool)>>,
+    paused: &mut bool,
+) {
+    if display_suppressed.load(Ordering::Acquire) {
+        if !*paused {
+            bridge.stop_audio();
+            *paused = true;
+            debug!("anland rdpsnd: muted (display suppressed)");
+        }
+        return;
+    }
+    if *paused {
+        *paused = false;
+        if let Ok(slot) = last_format.lock() {
+            if let Some((sr, ch, aac)) = *slot {
+                bridge.start_audio(sr, ch, aac);
+                debug!("anland rdpsnd: resumed (display restored)");
+            }
+        }
+    }
 }
 
 /// Convert a wire audio chunk to an `AudioWave` for the RDPSND dispatch task.
