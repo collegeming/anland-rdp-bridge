@@ -51,6 +51,11 @@ pub struct AnlandBridgeInbound {
     /// Latest coalesced clipboard image (PNG bytes) from Android. `None`
     /// means cleared / text-only.
     pub clipboard_image: watch::Receiver<Option<Vec<u8>>>,
+    /// Latest clipboard file list from Android (names + sizes). `None` /
+    /// empty means no files on the clipboard.
+    pub file_list: watch::Receiver<Option<Vec<wire::FileEntry>>>,
+    /// File content responses from Android, correlated by `request_id`.
+    pub file_content_rx: mpsc::Receiver<wire::FileContentResponse>,
 }
 
 /// Outbound control commands the RDP/EGFX side enqueues toward Android.
@@ -79,6 +84,14 @@ pub enum OutboundCmd {
     ClipboardImage { sequence: u64, png: Vec<u8> },
     /// Acknowledge an Android clipboard update.
     ClipboardAck { sequence: u64 },
+    /// Ask Android to return `length` bytes at `offset` of clipboard file
+    /// entry `index` (CLIPRDR FileContentsRequest RANGE).
+    FileContentRequest {
+        request_id: u32,
+        index: u32,
+        offset: u64,
+        length: u32,
+    },
 }
 
 /// A handle the RDP server uses to drive the bridge (outbound control) and
@@ -110,6 +123,8 @@ impl AnlandBridge {
         let (audio_tx, audio_rx) = mpsc::channel::<wire::AudioWireChunk>(16);
         let (clipboard_tx, clipboard_rx) = watch::channel(None);
         let (clipboard_image_tx, clipboard_image_rx) = watch::channel(None);
+        let (file_list_tx, file_list_rx) = watch::channel(None);
+        let (file_content_tx, file_content_rx) = mpsc::channel::<wire::FileContentResponse>(8);
         let video_discontinuity = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
         let desired_stream = Arc::new(Mutex::new(Some((width, height, fps))));
@@ -129,6 +144,8 @@ impl AnlandBridge {
             video_discontinuity: Arc::clone(&video_discontinuity),
             clipboard: clipboard_rx,
             clipboard_image: clipboard_image_rx,
+            file_list: file_list_rx,
+            file_content_rx,
         };
 
         let session = SessionRunner {
@@ -138,6 +155,8 @@ impl AnlandBridge {
             audio_tx,
             clipboard_tx,
             clipboard_image_tx,
+            file_list_tx,
+            file_content_tx,
             video_discontinuity: Arc::clone(&video_discontinuity),
             connected: Arc::clone(&connected),
             desired_stream: Arc::clone(&desired_stream),
@@ -201,6 +220,18 @@ impl AnlandBridge {
         let _ = self.outbound.send(OutboundCmd::ClipboardImage { sequence, png });
     }
 
+    /// Ask Android for `length` bytes at `offset` of clipboard file entry
+    /// `index`. The response arrives on `AnlandBridgeInbound.file_content_rx`
+    /// with the same `request_id`.
+    pub fn request_file_content(&self, request_id: u32, index: u32, offset: u64, length: u32) {
+        let _ = self.outbound.send(OutboundCmd::FileContentRequest {
+            request_id,
+            index,
+            offset,
+            length,
+        });
+    }
+
     /// Acknowledge an Android-origin update (matching sequence = compatibility
     /// ack for a pending `mstsc` update → drop it).
     pub fn ack_clipboard(&self, sequence: u64) {
@@ -239,6 +270,8 @@ struct SessionRunner {
     audio_tx: mpsc::Sender<wire::AudioWireChunk>,
     clipboard_tx: watch::Sender<Option<String>>,
     clipboard_image_tx: watch::Sender<Option<Vec<u8>>>,
+    file_list_tx: watch::Sender<Option<Vec<wire::FileEntry>>>,
+    file_content_tx: mpsc::Sender<wire::FileContentResponse>,
     video_discontinuity: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     desired_stream: Arc<Mutex<Option<(u16, u16, u8)>>>,
@@ -330,6 +363,8 @@ impl SessionRunner {
         let audio_tx = self.audio_tx.clone();
         let clipboard_tx = self.clipboard_tx.clone();
         let clipboard_image_tx = self.clipboard_image_tx.clone();
+        let file_list_tx = self.file_list_tx.clone();
+        let file_content_tx = self.file_content_tx.clone();
         let video_discontinuity = Arc::clone(&self.video_discontinuity);
         let connected = Arc::clone(&self.connected);
         let mut outbound = &mut self.outbound_rx;
@@ -350,6 +385,8 @@ impl SessionRunner {
                                 &audio_tx,
                                 &clipboard_tx,
                                 &clipboard_image_tx,
+                                &file_list_tx,
+                                &file_content_tx,
                                 &video_discontinuity,
                             )
                             .await
@@ -397,6 +434,8 @@ impl SessionRunner {
         audio_tx: &mpsc::Sender<wire::AudioWireChunk>,
         clipboard_tx: &watch::Sender<Option<String>>,
         clipboard_image_tx: &watch::Sender<Option<Vec<u8>>>,
+        file_list_tx: &watch::Sender<Option<Vec<wire::FileEntry>>>,
+        file_content_tx: &mpsc::Sender<wire::FileContentResponse>,
         video_discontinuity: &AtomicBool,
     ) -> bool {
         match msg_type {
@@ -464,6 +503,38 @@ impl SessionRunner {
                 }
                 Err(e) => {
                     warn!("anland bridge: bad clipboard image: {e}");
+                    true
+                }
+            },
+            msg::FILE_LIST => match wire::FileList::decode(data) {
+                Ok(list) => {
+                    let _ = file_list_tx.send(Some(list.entries));
+                    if let Err(e) = wire::write_frame(
+                        stream,
+                        msg::CLIPBOARD_ACK,
+                        &list.sequence.to_le_bytes(),
+                    )
+                    .await
+                    {
+                        warn!("anland bridge: file list ack write failed: {e}");
+                        return false;
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!("anland bridge: bad file list: {e}");
+                    true
+                }
+            },
+            msg::FILE_CONTENT_RESPONSE => match wire::FileContentResponse::decode(data) {
+                Ok(resp) => {
+                    if file_content_tx.send(resp).await.is_err() {
+                        debug!("anland bridge: file content channel closed");
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!("anland bridge: bad file content response: {e}");
                     true
                 }
             },
@@ -540,6 +611,21 @@ impl SessionRunner {
             OutboundCmd::ClipboardAck { sequence } => {
                 (msg::CLIPBOARD_ACK, sequence.to_le_bytes().to_vec())
             }
+            OutboundCmd::FileContentRequest {
+                request_id,
+                index,
+                offset,
+                length,
+            } => (
+                msg::FILE_CONTENT_REQUEST,
+                wire::FileContentRequest {
+                    request_id,
+                    index,
+                    offset,
+                    length,
+                }
+                .encode(),
+            ),
         };
         if let Err(e) = wire::write_frame(stream, msg_type, &payload).await {
             warn!("anland bridge: outbound write failed: {e}");

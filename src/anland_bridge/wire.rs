@@ -39,6 +39,9 @@ pub mod msg {
     pub const AUDIO_CHUNK: u8 = 20;
     pub const AUDIO_START: u8 = 21;
     pub const AUDIO_STOP: u8 = 22;
+    pub const FILE_LIST: u8 = 23;
+    pub const FILE_CONTENT_REQUEST: u8 = 24;
+    pub const FILE_CONTENT_RESPONSE: u8 = 25;
 
     // Authentication messages.
     pub const AUTH_INIT: u8 = 32;
@@ -239,6 +242,111 @@ impl ClipboardImage {
         let mut out = Vec::with_capacity(Self::SEQ_LEN + self.png.len());
         out.extend_from_slice(&self.sequence.to_le_bytes());
         out.extend_from_slice(&self.png);
+        out
+    }
+}
+
+/// One clipboard file entry (name + size), carried in `FILE_LIST`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+}
+
+/// A decoded `FILE_LIST` (message type 23) payload: Android's current
+/// clipboard file list.
+///
+/// Wire layout (little-endian):
+///
+/// ```text
+/// u64 sequence
+/// u32 count
+/// entries[]: u16 name_len || name (UTF-8) || u64 size
+/// ```
+#[derive(Debug, Clone)]
+pub struct FileList {
+    pub sequence: u64,
+    pub entries: Vec<FileEntry>,
+}
+
+impl FileList {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        ensure!(payload.len() >= 12, "anland bridge: file list too short");
+        let sequence = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        ensure!(sequence != 0, "anland bridge: file list sequence must be non-zero");
+        let count = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+        ensure!(count <= 1024, "anland bridge: file list count {count} too large");
+        let mut pos = 12usize;
+        let mut entries = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            ensure!(
+                pos + 2 <= payload.len(),
+                "anland bridge: file list truncated at entry name length"
+            );
+            let name_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            ensure!(
+                pos + name_len + 8 <= payload.len(),
+                "anland bridge: file list truncated in entry {pos}"
+            );
+            let name = std::str::from_utf8(&payload[pos..pos + name_len])
+                .map_err(|e| anyhow::anyhow!("anland bridge: file name not UTF-8: {e}"))?
+                .to_owned();
+            pos += name_len;
+            let size = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            entries.push(FileEntry { name, size });
+        }
+        Ok(Self { sequence, entries })
+    }
+}
+
+/// A `FILE_CONTENT_REQUEST` (message type 24) payload: fetch `length` bytes at
+/// `offset` of entry `index`. Server → Android.
+#[derive(Debug, Clone, Copy)]
+pub struct FileContentRequest {
+    pub request_id: u32,
+    pub index: u32,
+    pub offset: u64,
+    pub length: u32,
+}
+
+impl FileContentRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(20);
+        out.extend_from_slice(&self.request_id.to_le_bytes());
+        out.extend_from_slice(&self.index.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&self.length.to_le_bytes());
+        out
+    }
+}
+
+/// A `FILE_CONTENT_RESPONSE` (message type 25) payload: the requested bytes,
+/// or empty on EOF/error. Android → server.
+#[derive(Debug, Clone)]
+pub struct FileContentResponse {
+    pub request_id: u32,
+    pub data: Vec<u8>,
+}
+
+impl FileContentResponse {
+    pub const HEADER_LEN: usize = 4;
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        ensure!(
+            payload.len() >= Self::HEADER_LEN,
+            "anland bridge: file content response too short"
+        );
+        let request_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let data = payload[Self::HEADER_LEN..].to_vec();
+        Ok(Self { request_id, data })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::HEADER_LEN + self.data.len());
+        out.extend_from_slice(&self.request_id.to_le_bytes());
+        out.extend_from_slice(&self.data);
         out
     }
 }
@@ -455,5 +563,65 @@ mod tests {
 
         let empty = vec![0u8; ClipboardImage::SEQ_LEN];
         assert!(ClipboardImage::decode(&empty).is_err());
+    }
+
+    #[test]
+    fn file_list_round_trip() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&5u64.to_le_bytes()); // sequence
+        p.extend_from_slice(&2u32.to_le_bytes()); // count
+        for (name, size) in [("a.txt", 10u64), ("b.bin", 1_000_000u64)] {
+            let nb = name.as_bytes();
+            p.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            p.extend_from_slice(nb);
+            p.extend_from_slice(&size.to_le_bytes());
+        }
+        let fl = FileList::decode(&p).unwrap();
+        assert_eq!(fl.sequence, 5);
+        assert_eq!(
+            fl.entries,
+            vec![
+                FileEntry { name: "a.txt".into(), size: 10 },
+                FileEntry { name: "b.bin".into(), size: 1_000_000 },
+            ]
+        );
+    }
+
+    #[test]
+    fn file_list_rejects_truncated_and_zero_seq() {
+        // Truncated mid-entry.
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u64.to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&5u16.to_le_bytes()); // name_len
+        p.extend_from_slice(b"ab"); // only 2 of 5 bytes
+        assert!(FileList::decode(&p).is_err());
+
+        // Zero sequence.
+        let mut z = Vec::new();
+        z.extend_from_slice(&0u64.to_le_bytes());
+        z.extend_from_slice(&0u32.to_le_bytes());
+        assert!(FileList::decode(&z).is_err());
+    }
+
+    #[test]
+    fn file_content_request_response_round_trip() {
+        let req = FileContentRequest {
+            request_id: 7,
+            index: 1,
+            offset: 4096,
+            length: 64 * 1024,
+        };
+        let encoded = req.encode();
+        // The request is one-directional; just pin the layout.
+        assert_eq!(encoded.len(), 20);
+
+        let resp = FileContentResponse {
+            request_id: 7,
+            data: vec![0xAB; 16],
+        };
+        let decoded = FileContentResponse::decode(&resp.encode()).unwrap();
+        assert_eq!(decoded.request_id, 7);
+        assert_eq!(decoded.data, vec![0xAB; 16]);
     }
 }
