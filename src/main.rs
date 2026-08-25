@@ -37,6 +37,8 @@ mod multitransport;
 mod anland_bridge;
 #[cfg(not(target_os = "macos"))]
 mod platform;
+#[cfg(not(target_os = "macos"))]
+mod server;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
