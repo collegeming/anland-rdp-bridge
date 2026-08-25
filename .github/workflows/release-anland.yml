@@ -1,0 +1,95 @@
+name: release-anland
+
+# Build the anland-rdp-bridge aarch64 Linux binary on a native ARM runner and
+# publish it as an immutable per-tag release asset with a SHA256 checksum.
+#
+# Contract (mirrors the anland release policy):
+# - Runs on a native aarch64 runner (ubuntu-24.04-arm) — no cross-compile
+#   fragility; aws-lc-rs (rustls crypto) builds in-tree.
+# - Assets are per-tag and immutable: `skip-existing: true` so re-running a
+#   tag never clobbers an existing release asset.
+# - Consumers (e.g. a RootFS builder) download a FIXED tag + asset + SHA256;
+#   a checksum mismatch must hard-fail downstream.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-anland-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  build:
+    name: build aarch64 linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cmake (aws-lc-rs build dep)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Stage artifact + checksum
+        id: stage
+        run: |
+          set -euo pipefail
+          NAME="anland-rdp-bridge-aarch64-linux"
+          mkdir -p dist
+          tar -C target/release -czf "dist/${NAME}.tar.gz" anland_rdp_bridge
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "artifact=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: anland-aarch64
+          path: |
+            ${{ steps.stage.outputs.artifact }}
+            ${{ steps.stage.outputs.checksum }}
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: anland-aarch64
+          path: artifacts
+
+      - name: Publish (immutable, no-clobber)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          # Re-running a tag must never overwrite an existing asset.
+          skip-existing: true
