@@ -51,6 +51,10 @@ pub struct AnlandBackends {
     clipboard_rx: Option<watch::Receiver<Option<String>>>,
     /// Latest coalesced clipboard image (PNG bytes), for the CLIPRDR side.
     clipboard_image_rx: Option<watch::Receiver<Option<Vec<u8>>>>,
+    /// Latest clipboard file list, for the CLIPRDR file path.
+    file_list_rx: Option<watch::Receiver<Option<Vec<crate::anland_bridge::wire::FileEntry>>>>,
+    /// File content responses, for the CLIPRDR file path.
+    file_content_rx: Option<mpsc::Receiver<crate::anland_bridge::wire::FileContentResponse>>,
     display: DisplayInfo,
     /// Stream geometry/FPS, passed to `AnlandVideoSource::start`.
     width: u16,
@@ -78,6 +82,8 @@ impl AnlandBackends {
             video_discontinuity,
             clipboard,
             clipboard_image,
+            file_list,
+            file_content_rx,
         } = inbound;
         let backends = Self {
             bridge: bridge.clone(),
@@ -86,6 +92,8 @@ impl AnlandBackends {
             video_discontinuity,
             clipboard_rx: Some(clipboard),
             clipboard_image_rx: Some(clipboard_image),
+            file_list_rx: Some(file_list),
+            file_content_rx: Some(file_content_rx),
             display: DisplayInfo {
                 width,
                 height,
@@ -108,6 +116,20 @@ impl AnlandBackends {
     /// Take the clipboard image watch receiver. `None` after the first take.
     pub fn take_clipboard_image_rx(&mut self) -> Option<watch::Receiver<Option<Vec<u8>>>> {
         self.clipboard_image_rx.take()
+    }
+
+    /// Take the file-list watch receiver (CLIPRDR file path).
+    pub fn take_file_list_rx(
+        &mut self,
+    ) -> Option<watch::Receiver<Option<Vec<crate::anland_bridge::wire::FileEntry>>>> {
+        self.file_list_rx.take()
+    }
+
+    /// Take the file-content response receiver (CLIPRDR file path).
+    pub fn take_file_content_rx(
+        &mut self,
+    ) -> Option<mpsc::Receiver<crate::anland_bridge::wire::FileContentResponse>> {
+        self.file_content_rx.take()
     }
 
     /// Take the audio chunk receiver (for the RDPSND pump). `None` after the
