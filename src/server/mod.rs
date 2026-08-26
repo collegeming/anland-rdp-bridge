@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler,
@@ -164,7 +165,10 @@ impl AnlandRdpServer {
         // Clone the bridge for the video pump before moving it into the input
         // handler (which forwards keyboard/mouse through it).
         let bridge_for_pump = bridge.clone();
-        let input = AnlandInputHandler { bridge };
+        let input = AnlandInputHandler {
+            bridge,
+            lock_state: Default::default(),
+        };
 
         let mut rdp_server = RdpServer::builder()
             .with_addr(config.listen_addr)
@@ -410,19 +414,24 @@ impl RdpServerDisplay for AnlandDisplay {
 
 /// Forwards `mstsc` keyboard/mouse to the Android input sink over the bridge.
 /// Mouse is fully mapped; keyboard translates the RDP scancode (+ extended
-/// flag) to the evdev keycode via [`evdev_scancodes`].
+/// flag) to the evdev keycode via [`evdev_scancodes`], and reconciles the
+/// remote lock state (CapsLock/NumLock/ScrollLock) from the client's
+/// `Synchronize` event by toggling only the lock keys that differ.
 struct AnlandInputHandler {
     bridge: AnlandBridge,
+    /// Lock state as tracked on the remote session (see [`evdev_scancodes::LockState`]).
+    lock_state: evdev_scancodes::LockState,
 }
 
 impl RdpServerInputHandler for AnlandInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        // Translate the RDP Set 1 scancode (with its extended flag) to the
-        // Linux evdev keycode the bridge expects — raw-forwarding the
-        // scancode would make Win/Meta keys come out as unrelated keys and
-        // niri's Mod- keybinds (e.g. Win+T) would never fire.
-        let (action, code) = match event {
+        match event {
+            KeyboardEvent::Synchronize(flags) => self.sync_lock_state(flags),
             KeyboardEvent::Pressed { code, extended } => {
+                // Track lock-key presses: each forwarded lock-key press toggles
+                // the remote xkb state, so the tracked state must flip in lock
+                // step or a later Synchronize would double-toggle.
+                self.note_lock_key(code);
                 let Some(keycode) = evdev_scancodes::scancode_to_evdev(code, extended) else {
                     debug!(
                         scancode = format!("0x{code:02X}"),
@@ -431,21 +440,20 @@ impl RdpServerInputHandler for AnlandInputHandler {
                     );
                     return;
                 };
-                (0u8, keycode)
+                self.bridge.send_key(0, keycode);
             }
             KeyboardEvent::Released { code, extended } => {
                 let Some(keycode) = evdev_scancodes::scancode_to_evdev(code, extended) else {
                     return;
                 };
-                (1u8, keycode)
+                self.bridge.send_key(1, keycode);
             }
-            // Unicode + Synchronize are not key events on the wire; lock-state
-            // sync (Synchronize) is a follow-up.
-            KeyboardEvent::UnicodePressed(_) | KeyboardEvent::UnicodeReleased(_)
-            | KeyboardEvent::Synchronize(_) => return,
-        };
-        self.bridge.send_key(action, code);
+            // Unicode text input is dropped (RDP defaults to scancodes; the
+            // remote xkb layout governs the resulting characters).
+            KeyboardEvent::UnicodePressed(_) | KeyboardEvent::UnicodeReleased(_) => {}
+        }
     }
+
 
     fn mouse(&mut self, event: MouseEvent) {
         match event {
@@ -473,6 +481,36 @@ impl RdpServerInputHandler for AnlandInputHandler {
             MouseEvent::RelMove { x, y } => {
                 self.bridge.send_mouse_motion(0, 0.0, 0.0, x as f32, y as f32);
             }
+        }
+    }
+}
+
+impl AnlandInputHandler {
+    /// Reconcile the remote lock state to the client's `Synchronize` report by
+    /// toggling (press+release) each lock key whose state differs. Idempotent:
+    /// an in-sync report produces no churn.
+    fn sync_lock_state(&mut self, flags: SynchronizeFlags) {
+        let toggles = evdev_scancodes::lock_toggles(
+            flags.contains(SynchronizeFlags::NUM_LOCK),
+            flags.contains(SynchronizeFlags::CAPS_LOCK),
+            flags.contains(SynchronizeFlags::SCROLL_LOCK),
+            &mut self.lock_state,
+        );
+        for keycode in toggles {
+            debug!(keycode, "anland input: toggling remote lock key");
+            self.bridge.send_key(0, keycode);
+            self.bridge.send_key(1, keycode);
+        }
+    }
+
+    /// Flip the tracked lock state when a lock key is pressed (it toggles the
+    /// remote session, so the server-side mirror must follow).
+    fn note_lock_key(&mut self, scancode: u8) {
+        match scancode {
+            0x3A => self.lock_state.caps_lock = !self.lock_state.caps_lock, // CapsLock
+            0x45 => self.lock_state.num_lock = !self.lock_state.num_lock, // NumLock
+            0x46 => self.lock_state.scroll_lock = !self.lock_state.scroll_lock, // ScrollLock
+            _ => {}
         }
     }
 }
