@@ -3278,6 +3278,16 @@ mod anland_entry {
             .unwrap_or_else(|_| "30".into())
             .parse()
             .context("ANLAND_FPS")?;
+        // Upper bound a client-requested MS-RDPEDISP live resize is clamped
+        // to (niri modes top out at 4096x2160 by default).
+        let max_width: u16 = std::env::var("ANLAND_MAX_WIDTH")
+            .unwrap_or_else(|_| "4096".into())
+            .parse()
+            .context("ANLAND_MAX_WIDTH")?;
+        let max_height: u16 = std::env::var("ANLAND_MAX_HEIGHT")
+            .unwrap_or_else(|_| "2160".into())
+            .parse()
+            .context("ANLAND_MAX_HEIGHT")?;
 
         let (cert_path, key_path) = ensure_cert()?;
         let bridge_token = ensure_bridge_token()?;
@@ -3291,6 +3301,8 @@ mod anland_entry {
             width,
             height,
             fps,
+            max_width,
+            max_height,
         };
 
         let mut server = AnlandRdpServer::new(&config).context("init anland RDP server")?;
