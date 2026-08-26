@@ -11,9 +11,10 @@
 //! - `with_input_handler(AnlandInputHandler)` — forwards keyboard/mouse from
 //!   `mstsc` to the Android input sink via the bridge. Mouse is mapped
 //!   (absolute move, button press/release, vertical scroll); keyboard
-//!   forwards the RDP scancode as the evdev keycode (the full RDP→evdev
-//!   scancode table from the inherited `input/scancodes.rs` is wired in a
-//!   follow-up).
+//!   translates the RDP Set 1 scancode (+ extended flag) to the Linux evdev
+//!   keycode via [`evdev_scancodes`] so modifier keys (Win/Meta, right
+//!   Ctrl/Alt) and navigation keys reach niri correctly — Win+T fires niri's
+//!   Mod+T instead of a raw scancode.
 //! - `with_display_handler(AnlandDisplay)` — advertises the current anland
 //!   desktop size (config initial, then the client-resized live size) and
 //!   implements MS-RDPEDISP `request_layout` (dynamic resolution): a client
@@ -32,6 +33,7 @@
 
 /// anland RDP server module.
 pub mod cliprdr;
+mod evdev_scancodes;
 pub mod gfx;
 pub mod rdpsnd;
 
@@ -407,25 +409,41 @@ impl RdpServerDisplay for AnlandDisplay {
 }
 
 /// Forwards `mstsc` keyboard/mouse to the Android input sink over the bridge.
-/// Mouse is fully mapped; keyboard forwards the RDP scancode as the evdev
-/// keycode (the full RDP→evdev scancode table is a follow-up).
+/// Mouse is fully mapped; keyboard translates the RDP scancode (+ extended
+/// flag) to the evdev keycode via [`evdev_scancodes`].
 struct AnlandInputHandler {
     bridge: AnlandBridge,
 }
 
 impl RdpServerInputHandler for AnlandInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        // action: 0 = down, 1 = up (bridge KEY payload).
+        // Translate the RDP Set 1 scancode (with its extended flag) to the
+        // Linux evdev keycode the bridge expects — raw-forwarding the
+        // scancode would make Win/Meta keys come out as unrelated keys and
+        // niri's Mod- keybinds (e.g. Win+T) would never fire.
         let (action, code) = match event {
-            KeyboardEvent::Pressed { code, .. } => (0u8, u32::from(code)),
-            KeyboardEvent::Released { code, .. } => (1u8, u32::from(code)),
-            // Unicode + Synchronize are not key events on the wire; the full
-            // unicode/scancode mapping is wired with input/scancodes.rs later.
+            KeyboardEvent::Pressed { code, extended } => {
+                let Some(keycode) = evdev_scancodes::scancode_to_evdev(code, extended) else {
+                    debug!(
+                        scancode = format!("0x{code:02X}"),
+                        extended,
+                        "anland input: unmapped scancode dropped"
+                    );
+                    return;
+                };
+                (0u8, keycode)
+            }
+            KeyboardEvent::Released { code, extended } => {
+                let Some(keycode) = evdev_scancodes::scancode_to_evdev(code, extended) else {
+                    return;
+                };
+                (1u8, keycode)
+            }
+            // Unicode + Synchronize are not key events on the wire; lock-state
+            // sync (Synchronize) is a follow-up.
             KeyboardEvent::UnicodePressed(_) | KeyboardEvent::UnicodeReleased(_)
             | KeyboardEvent::Synchronize(_) => return,
         };
-        // TODO: map RDP scancode → Linux evdev keycode via the inherited
-        // input/scancodes.rs table. For now forward the scancode as-is.
         self.bridge.send_key(action, code);
     }
 
