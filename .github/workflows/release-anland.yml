@@ -40,7 +40,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install cmake (aws-lc-rs build dep)
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - name: Install PipeWire dev headers (native/anland_rdp_audio.c build dep)
+        # The C audio capture shim links libpipewire-0.3 + libspa-0.2; build.rs
+        # resolves them via pkg-config with a fallback to /usr/include/{pipewire-0.3,spa-0.2}.
+        run: sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
