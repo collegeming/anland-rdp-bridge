@@ -22,9 +22,67 @@
 //!
 //! Values are from `linux/input-event-codes.h` (checked against Arch's
 //! `/usr/include/linux/input-event-codes.h`).
+//!
+//! ## Non-US layouts need no per-key translation
+//!
+//! RDP carries *scancodes*, not characters. The remote session's own xkb
+//! layout translates evdev keycode → keysym in the compositor, so a German /
+//! French / … remote layout produces the right characters with no server-side
+//! work — this is standard RDP semantics (a Windows RDP server behaves the
+//! same way). Only the physical key *positions* matter here, and the ISO
+//! extra key (0x56 → `KEY_102ND`) is covered. The macOS fork needed a
+//! client-layout translation because it streams a *local* macOS session; the
+//! anland streaming model does not.
 
 /// Sentinel for "no mapping" — well outside the evdev keycode range.
 const NONE: u32 = u32::MAX;
+
+/// Evdev keycodes of the lock keys, used by the `Synchronize` lock-state
+/// reconciliation in the input handler.
+pub(crate) const KEY_CAPSLOCK: u32 = 58;
+pub(crate) const KEY_NUMLOCK: u32 = 69;
+pub(crate) const KEY_SCROLLLOCK: u32 = 70;
+
+/// Remote lock state (CapsLock/NumLock/ScrollLock) as tracked by the input
+/// handler. Mirrors the client's reported state so a later `Synchronize`
+/// only toggles keys that actually differ.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockState {
+    pub num_lock: bool,
+    pub caps_lock: bool,
+    pub scroll_lock: bool,
+}
+
+/// Compute which lock keys need a press+release toggle to bring the remote
+/// session from `tracked` up to the requested state, updating `tracked` in
+/// place. Pure — the caller injects each returned keycode (down then up) over
+/// the bridge, which toggles the remote xkb lock state. The bridge only
+/// carries key events, so lock state is *toggled*, not set — the same
+/// reconciliation model xrdp uses.
+pub(crate) fn lock_toggles(
+    num_lock: bool,
+    caps_lock: bool,
+    scroll_lock: bool,
+    tracked: &mut LockState,
+) -> Vec<u32> {
+    let want = LockState {
+        num_lock,
+        caps_lock,
+        scroll_lock,
+    };
+    let mut toggles = Vec::new();
+    if want.caps_lock != tracked.caps_lock {
+        toggles.push(KEY_CAPSLOCK);
+    }
+    if want.num_lock != tracked.num_lock {
+        toggles.push(KEY_NUMLOCK);
+    }
+    if want.scroll_lock != tracked.scroll_lock {
+        toggles.push(KEY_SCROLLLOCK);
+    }
+    *tracked = want;
+    toggles
+}
 
 /// PS/2 Set 1 scancode → evdev keycode. `extended` is the RDP keyboard-event
 /// extended flag. Returns `None` for unmapped scancodes (non-US layouts, media
@@ -199,5 +257,20 @@ mod tests {
     fn unmapped_scancodes_return_none() {
         assert_eq!(scancode_to_evdev(0xFF, false), None);
         assert_eq!(scancode_to_evdev(0x00, true), None);
+    }
+
+    #[test]
+    fn lock_toggles_only_keys_that_differ_and_updates_tracked() {
+        let mut tracked = LockState::default();
+        // Fresh remote (all off), client reports CapsLock on → toggle caps.
+        assert_eq!(lock_toggles(false, true, false, &mut tracked), vec![58]);
+        assert_eq!(tracked, LockState { caps_lock: true, ..Default::default() });
+
+        // In sync → no toggles, no churn.
+        assert!(lock_toggles(false, true, false, &mut tracked).is_empty());
+
+        // Client now reports all off → toggle caps off, num on.
+        assert_eq!(lock_toggles(true, false, false, &mut tracked), vec![58, 69]);
+        assert_eq!(tracked, LockState { num_lock: true, ..Default::default() });
     }
 }
