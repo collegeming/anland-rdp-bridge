@@ -82,6 +82,17 @@ anland-rdp-bridge
              Windows mstsc
 ```
 
+## mstsc keyboard shortcut combos
+
+Win-key shortcuts (`Win+T` → niri `Mod+T`, `Win+D`, …) only reach the remote
+desktop when **mstsc** is set to forward them. In the client: *Local
+Resources → Keyboard → Apply key combinations to* must be **"On the remote
+computer"** (the default is *"Only when using the full screen"*, which keeps
+non-fullscreen Win combos local to Windows — this looks exactly like a server
+input bug but is client-side). The server itself translates RDP Set 1
+scancodes to Linux evdev keycodes correctly, including the Win/Meta key in
+both its extended and non-extended forms (`src/server/evdev_scancodes.rs`).
+
 ## Build
 
 The anland target is Arch Linux ARM (aarch64). The macOS build path inherited

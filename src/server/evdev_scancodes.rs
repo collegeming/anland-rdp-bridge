@@ -15,6 +15,9 @@
 //! - Left/right Windows (GUI) 0x5B/0x5C = 91/92 → evdev `KEY_LEFTMETA`/`KEY_RIGHTMETA`
 //!   = **125/126**. Forwarded raw, 91 is `KEY_HIRAGANA` — so niri's `Mod+T`
 //!   (Win+T) never fires because the compositor never sees a Meta press.
+//!   Mapped in BOTH the normal and extended tables: clients disagree on the
+//!   extended flag for the Win keys (lamco's mapper and mstsc handle the
+//!   E0-prefixed form), so only one variant would drop real Win presses.
 //! - Right Ctrl/Alt are extended scancodes (0x1D/0x38 + extended flag) that
 //!   raw-forwarding collapses onto their left halves.
 //! - Navigation/Insert/Delete/PrintScreen are extended keys with unrelated
@@ -213,6 +216,8 @@ const fn build_scancode_extended() -> [u32; 256] {
     t[0x51] = 109; // PageDown → KEY_PAGEDOWN
     t[0x52] = 110; // Insert → KEY_INSERT
     t[0x53] = 111; // Delete → KEY_DELETE
+    t[0x5B] = 125; // Left Win/GUI → KEY_LEFTMETA (some clients send it extended)
+    t[0x5C] = 126; // Right Win/GUI → KEY_RIGHTMETA
     t[0x5D] = 139; // Apps / context-menu → KEY_MENU
     t
 }
@@ -240,6 +245,11 @@ mod tests {
         // become KEY_LEFTMETA/KEY_RIGHTMETA, not 91/92 (KEY_HIRAGANA/…).
         assert_eq!(scancode_to_evdev(0x5B, false), Some(125));
         assert_eq!(scancode_to_evdev(0x5C, false), Some(126));
+        // Clients differ on the extended flag for the Win keys (mstsc /
+        // lamco's mapper both handle the E0 5B form); both variants must
+        // translate or a real Win press gets silently dropped.
+        assert_eq!(scancode_to_evdev(0x5B, true), Some(125));
+        assert_eq!(scancode_to_evdev(0x5C, true), Some(126));
     }
 
     #[test]
