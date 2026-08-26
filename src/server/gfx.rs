@@ -34,6 +34,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::anland_bridge::AnlandBridge;
 use crate::platform::{EncodedVideoFrame, VideoFrameSource};
+use crate::server::AnlandDisplayState;
 
 /// At most three EGFX frames in flight; frame ACKs provide backpressure.
 const MAX_FRAMES_IN_FLIGHT: u32 = 3;
@@ -225,13 +226,14 @@ pub fn spawn_video_pump(
     // as a discontinuity (clear the prediction chain, request an IDR, drop
     // P-frames until a fresh keyframe).
     bridge_discontinuity: Arc<AtomicBool>,
-    display_width: u16,
-    display_height: u16,
+    // Shared display geometry + revision counter: a client-requested
+    // MS-RDPEDISP resize bumps the revision; the pump resets the graphics
+    // pipeline at the new size (see `check_resize`).
+    display_state: Arc<AnlandDisplayState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
-        let encoded_width = align_16(display_width);
-        let encoded_height = align_16(display_height);
+        let mut last_revision = display_state.revision();
         let mut current_handle: Option<GfxServerHandle> = None;
         let mut surface_id: Option<u16> = None;
         let mut awaiting_idr = true;
@@ -250,6 +252,12 @@ pub fn spawn_video_pump(
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
                         enter_discontinuity(&bridge, &mut awaiting_idr);
+                    }
+                    if let Err(e) = check_resize(
+                        &display_state, &mut last_revision, current_handle.as_ref(),
+                        &mut surface_id, &mut awaiting_idr, &bridge, &event_tx,
+                    ) {
+                        debug!("anland gfx: resize failed: {e}");
                     }
                 }
                 frame = source.next_frame() => {
@@ -287,26 +295,39 @@ pub fn spawn_video_pump(
                         }
                     }
 
+                    // A client-requested resize (revision bumped by
+                    // `AnlandDisplay::request_layout`): reset the EGFX
+                    // graphics pipeline at the new size (DeleteSurface old +
+                    // ResetGraphics), then recreate the surface below.
+                    if let Err(e) = check_resize(
+                        &display_state, &mut last_revision, current_handle.as_ref(),
+                        &mut surface_id, &mut awaiting_idr, &bridge, &event_tx,
+                    ) {
+                        debug!("anland gfx: resize failed: {e}");
+                    }
+
                     if state.needs_full_reinit.swap(false, Ordering::AcqRel) {
                         surface_id = None;
                         enter_discontinuity(&bridge, &mut awaiting_idr);
                     }
 
-                    // Create the surface if EGFX is ready + AVC420 + no surface.
+                    // Create the surface if EGFX is ready + AVC420 + no surface,
+                    // at the current (possibly client-resized) geometry.
                     if surface_id.is_none()
                         && state.ready.load(Ordering::Acquire)
                         && state.supports_avc420.load(Ordering::Acquire)
                     {
                         if let Some(handle) = current_handle.as_ref() {
+                            let geom = display_state.size();
                             match create_surface(
-                                handle, display_width, display_height,
-                                encoded_width, encoded_height, &event_tx,
+                                handle, geom.width, geom.height,
+                                align_16(geom.width), align_16(geom.height), &event_tx,
                             ) {
                                 Ok(id) => {
                                     surface_id = Some(id);
                                     awaiting_idr = true;
                                     bridge.request_idr();
-                                    info!(surface_id = id, "anland gfx: surface initialized");
+                                    info!(surface_id = id, w = geom.width, h = geom.height, "anland gfx: surface initialized");
                                 }
                                 Err(e) => debug!("anland gfx: surface not ready: {e}"),
                             }
@@ -450,6 +471,64 @@ fn send_dvc_output(
 fn enter_discontinuity(bridge: &AnlandBridge, awaiting_idr: &mut bool) {
     *awaiting_idr = true;
     bridge.request_idr();
+}
+
+/// Detect a client-requested live resize (MS-RDPEDISP) by comparing the
+/// display state's revision counter, and reset the EGFX graphics pipeline at
+/// the new size: `resize_with_monitors` (DeleteSurface of the old surfaces +
+/// RDPGFX_RESET_GRAPHICS at the new dimensions) so mstsc drops the stale-size
+/// surface, then clear the local surface state — the surface-recreate path
+/// rebuilds at the new geometry and the IDR request forces a fresh keyframe.
+///
+/// The core Deactivation-Reactivation itself is driven independently by the
+/// `DisplayUpdate::Resize` the display handler emits (see `AnlandDisplay`).
+/// Idempotent: only acts once per accepted resize.
+#[allow(clippy::too_many_arguments)]
+fn check_resize(
+    display_state: &AnlandDisplayState,
+    last_revision: &mut u64,
+    current_handle: Option<&GfxServerHandle>,
+    surface_id: &mut Option<u16>,
+    awaiting_idr: &mut bool,
+    bridge: &AnlandBridge,
+    event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) -> Result<()> {
+    let revision = display_state.revision();
+    if revision == *last_revision {
+        return Ok(());
+    }
+    *last_revision = revision;
+    let (w, h) = {
+        let s = display_state.size();
+        (s.width, s.height)
+    };
+
+    if let Some(handle) = current_handle {
+        let (channel_id, output) = {
+            let mut server = handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("EGFX server lock poisoned"))?;
+            if !server.is_ready() {
+                // EGFX not negotiated yet; the surface-recreate path below
+                // will build at the new size once it is.
+                return Ok(());
+            }
+            let channel_id = server.channel_id().context("EGFX channel has no ID")?;
+            server.resize_with_monitors(w, h, Vec::new());
+            (channel_id, server.drain_output())
+        };
+        send_dvc_output(event_tx, channel_id, output)?;
+    }
+
+    *surface_id = None;
+    *awaiting_idr = true;
+    bridge.request_idr();
+    info!(
+        w,
+        h,
+        "anland gfx: client resize accepted — graphics pipeline reset at new size"
+    );
+    Ok(())
 }
 
 fn align_16(value: u16) -> u16 {
