@@ -333,11 +333,15 @@ impl AudioSource for AnlandAudioSource {
     }
 
     fn stop(&self) {
-        // Intentionally a no-op on the C engine: the RDPSND pump already
-        // mutes shipping via its `paused` flag, and tearing down/rebuilding
-        // the PipeWire thread loop on every SuppressOutput would cost ~1s of
-        // dead air on resume. The capture ring keeps draining and drops oldest
-        // bytes on overflow while muted — harmless and resume is instant.
+        // Tear down the PipeWire engine (thread loop + virtual sink). The
+        // RDPSND pump only calls this after a sustained suppression (2s), so
+        // a quick minimize/restore doesn't pay the ~1s rebuild cost, but a long
+        // idle stops powering/tearing the sound service for nothing. `start()`
+        // rebuilds it on resume.
+        if self.started.swap(false, Ordering::SeqCst) {
+            // SAFETY: idempotent teardown; joins the PipeWire thread loop.
+            unsafe { anland_rdp_audio_stop() };
+        }
     }
 }
 

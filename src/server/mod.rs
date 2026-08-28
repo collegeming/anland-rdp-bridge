@@ -162,9 +162,6 @@ impl AnlandRdpServer {
             max_width: config.max_width,
             max_height: config.max_height,
         };
-        // Clone the bridge for the video pump before moving it into the input
-        // handler (which forwards keyboard/mouse through it).
-        let bridge_for_pump = bridge.clone();
         let input = AnlandInputHandler {
             bridge,
             lock_state: Default::default(),
@@ -200,7 +197,6 @@ impl AnlandRdpServer {
                 latest_handle,
                 gfx_state,
                 rdp_server.event_sender().clone(),
-                bridge_for_pump,
                 display_suppressed.clone(),
                 bridge_discontinuity,
                 display_state,

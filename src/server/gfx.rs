@@ -225,7 +225,6 @@ pub fn spawn_video_pump(
     latest_handle: Arc<Mutex<Option<GfxServerHandle>>>,
     state: Arc<GraphicsState>,
     event_tx: mpsc::UnboundedSender<ServerEvent>,
-    bridge: AnlandBridge,
     display_suppressed: Arc<AtomicBool>,
     // Set by the bridge on Android reconnect / bad frame — the pump treats it
     // as a discontinuity (clear the prediction chain, request an IDR, drop
@@ -252,15 +251,15 @@ pub fn spawn_video_pump(
                 _ = shutdown_rx.recv() => break,
                 _ = poll.tick() => {
                     update_suppression(
-                        &source, &bridge, &state, &display_suppressed,
+&*source, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
-                        enter_discontinuity(&bridge, &mut awaiting_idr);
+                        enter_discontinuity(&*source, &mut awaiting_idr);
                     }
                     if let Err(e) = check_resize(
                         &display_state, &mut last_revision, current_handle.as_ref(),
-                        &mut surface_id, &mut awaiting_idr, &bridge, &event_tx,
+                        &mut surface_id, &mut awaiting_idr, &*source, &event_tx,
                     ) {
                         debug!("anland gfx: resize failed: {e}");
                     }
@@ -276,11 +275,11 @@ pub fn spawn_video_pump(
                     };
 
                     update_suppression(
-                        &source, &bridge, &state, &display_suppressed,
+&*source, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
-                        enter_discontinuity(&bridge, &mut awaiting_idr);
+                        enter_discontinuity(&*source, &mut awaiting_idr);
                     }
                     if stream_paused || display_suppressed.load(Ordering::Acquire) {
                         continue;
@@ -306,33 +305,39 @@ pub fn spawn_video_pump(
                     // ResetGraphics), then recreate the surface below.
                     if let Err(e) = check_resize(
                         &display_state, &mut last_revision, current_handle.as_ref(),
-                        &mut surface_id, &mut awaiting_idr, &bridge, &event_tx,
+                        &mut surface_id, &mut awaiting_idr, &*source, &event_tx,
                     ) {
                         debug!("anland gfx: resize failed: {e}");
                     }
 
                     if state.needs_full_reinit.swap(false, Ordering::AcqRel) {
                         surface_id = None;
-                        enter_discontinuity(&bridge, &mut awaiting_idr);
+                        enter_discontinuity(&*source, &mut awaiting_idr);
                     }
 
                     // Create the surface if EGFX is ready + AVC420 + no surface,
-                    // at the current (possibly client-resized) geometry.
+                    // sized from the *frame's* authoritative dims (display =
+                    // logical region, encoded = MediaCodec's 16-aligned buffer).
+                    // `display_state` is the fallback for a source that doesn't
+                    // populate per-frame dims.
                     if surface_id.is_none()
                         && state.ready.load(Ordering::Acquire)
                         && state.supports_avc420.load(Ordering::Acquire)
                     {
                         if let Some(handle) = current_handle.as_ref() {
                             let geom = display_state.size();
+                            let disp_w = if frame.display_width > 0 { frame.display_width } else { geom.width };
+                            let disp_h = if frame.display_height > 0 { frame.display_height } else { geom.height };
+                            let enc_w = if frame.encoded_width > 0 { frame.encoded_width } else { align_16(disp_w) };
+                            let enc_h = if frame.encoded_height > 0 { frame.encoded_height } else { align_16(disp_h) };
                             match create_surface(
-                                handle, geom.width, geom.height,
-                                align_16(geom.width), align_16(geom.height), &event_tx,
+                                handle, disp_w, disp_h, enc_w, enc_h, &event_tx,
                             ) {
                                 Ok(id) => {
                                     surface_id = Some(id);
                                     awaiting_idr = true;
-                                    bridge.request_idr();
-                                    info!(surface_id = id, w = geom.width, h = geom.height, "anland gfx: surface initialized");
+                                    source.request_keyframe();
+                                    info!(surface_id = id, disp_w, disp_h, enc_w, enc_h, "anland gfx: surface initialized");
                                 }
                                 Err(e) => debug!("anland gfx: surface not ready: {e}"),
                             }
@@ -347,11 +352,23 @@ pub fn spawn_video_pump(
                     let (Some(handle), Some(sid)) = (current_handle.as_ref(), surface_id) else {
                         continue;
                     };
+                    // EGFX backpressure: skip this frame when the client has too
+                    // many un-ACKed frames in flight, so a slow mstsc can't make
+                    // us buffer unboundedly. The next poll tick retries.
+                    {
+                        let server = match handle.lock() {
+                            Ok(g) => g,
+                            Err(_) => continue,
+                        };
+                        if server.frames_in_flight() >= MAX_FRAMES_IN_FLIGHT {
+                            continue;
+                        }
+                    }
                     match send_video_frame(handle, sid, &frame, &event_tx) {
                         Ok(()) => { if frame.is_keyframe { awaiting_idr = false; } }
                         Err(e) => {
                             debug!("anland gfx: frame dropped: {e}");
-                            enter_discontinuity(&bridge, &mut awaiting_idr);
+                            enter_discontinuity(&*source, &mut awaiting_idr);
                         }
                     }
                 }
@@ -368,8 +385,7 @@ pub fn spawn_video_pump(
 /// holds the width/height/fps needed to do it.
 #[allow(clippy::fn_params_excessive_bools)]
 fn update_suppression(
-    source: &Box<dyn VideoFrameSource + Send>,
-    bridge: &AnlandBridge,
+    source: &dyn VideoFrameSource,
     state: &GraphicsState,
     display_suppressed: &Arc<AtomicBool>,
     suppression_started: &mut Option<Instant>,
@@ -382,7 +398,7 @@ fn update_suppression(
         }
         let started = suppression_started.get_or_insert_with(Instant::now);
         if started.elapsed() >= SUPPRESSION_PAUSE_AFTER {
-            bridge.stop_stream();
+            source.stop();
             *stream_paused = true;
             *awaiting_idr = true;
             info!("anland gfx: display suppressed; stopped Android encoder");
@@ -402,7 +418,7 @@ fn update_suppression(
         }
     } else if was_suppressed {
         *awaiting_idr = true;
-        bridge.request_idr();
+        source.request_keyframe();
     }
 }
 
@@ -480,9 +496,9 @@ fn send_dvc_output(
     Ok(())
 }
 
-fn enter_discontinuity(bridge: &AnlandBridge, awaiting_idr: &mut bool) {
+fn enter_discontinuity(source: &dyn VideoFrameSource, awaiting_idr: &mut bool) {
     *awaiting_idr = true;
-    bridge.request_idr();
+    source.request_keyframe();
 }
 
 /// Detect a client-requested live resize (MS-RDPEDISP) by comparing the
@@ -502,7 +518,7 @@ fn check_resize(
     current_handle: Option<&GfxServerHandle>,
     surface_id: &mut Option<u16>,
     awaiting_idr: &mut bool,
-    bridge: &AnlandBridge,
+    source: &dyn VideoFrameSource,
     event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) -> Result<()> {
     let revision = display_state.revision();
@@ -534,7 +550,7 @@ fn check_resize(
 
     *surface_id = None;
     *awaiting_idr = true;
-    bridge.request_idr();
+    source.request_keyframe();
     info!(
         w,
         h,

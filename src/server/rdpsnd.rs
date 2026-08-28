@@ -26,12 +26,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
 use ironrdp_server::{AudioWave, SoundServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
+
+/// After this long suppressed, stop the Linux capture (tear down the PipeWire
+/// engine); a shorter minimize just mutes the outbound channel.
+const SUPPRESSION_PAUSE_AFTER: Duration = Duration::from_secs(2);
 
 use crate::platform::{AudioChunk, AudioSource};
 
@@ -67,9 +72,7 @@ impl ServerEventSender for AnlandRdpsndFactory {
 
 impl SoundServerFactory for AnlandRdpsndFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        Box::new(AnlandRdpsndBackend {
-            latest_audio_sender: Arc::clone(&self.latest_audio_sender),
-        })
+        Box::new(AnlandRdpsndBackend)
     }
 
     fn set_audio_sender(&mut self, audio_sender: mpsc::Sender<AudioWave>) {
@@ -79,10 +82,10 @@ impl SoundServerFactory for AnlandRdpsndFactory {
     }
 }
 
-/// Per-connection RDPSND backend.
-pub struct AnlandRdpsndBackend {
-    latest_audio_sender: Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>,
-}
+/// Per-connection RDPSND backend. Stateless: the factory owns the shared
+/// audio-sender slot the pump writes into; the backend only answers format
+/// negotiation, so it holds no per-connection state.
+pub struct AnlandRdpsndBackend;
 
 impl std::fmt::Debug for AnlandRdpsndBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -143,14 +146,38 @@ pub fn spawn_audio_pump(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
-        // Kick the capture shim once; the source is idempotent so later
-        // suppression/resume is a no-op (the shim keeps buffering and drops
-        // oldest on overflow — cheapest possible semantics for an RDP pipe).
         audio_source.start();
+
+        let mut poll = tokio::time::interval(Duration::from_millis(500));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut suppression_started: Option<Instant> = None;
+        let mut source_stopped = false;
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                _ = poll.tick() => {
+                    // Stop the capture after a sustained suppression; restart on
+                    // resume. A quick minimize/restore never toggles (cheapest
+                    // path — it just mutes via the in-loop check below).
+                    if display_suppressed.load(Ordering::Acquire) {
+                        if !source_stopped {
+                            let started = suppression_started.get_or_insert_with(Instant::now);
+                            if started.elapsed() >= SUPPRESSION_PAUSE_AFTER {
+                                audio_source.stop();
+                                source_stopped = true;
+                                debug!("anland rdpsnd: muted (capture stopped after sustained suppression)");
+                            }
+                        }
+                    } else {
+                        suppression_started = None;
+                        if source_stopped {
+                            audio_source.start();
+                            source_stopped = false;
+                            debug!("anland rdpsnd: resumed (capture restarted)");
+                        }
+                    }
+                }
                 chunk = audio_source.next_chunk() => {
                     let chunk = match chunk {
                         Ok(Some(c)) => c,
@@ -161,12 +188,8 @@ pub fn spawn_audio_pump(
                         }
                     };
 
-                    // Suppression (client minimized) just mutes the outbound
-                    // channel — the source stays warm, niri/PipeWire keep
-                    // capturing, and the first frame after restore ships
-                    // immediately.
                     if display_suppressed.load(Ordering::Acquire) {
-                        continue;
+                        continue; // muted while minimized
                     }
                     let wave = make_wave(&chunk);
                     let sender = match latest_audio_sender.lock() {
