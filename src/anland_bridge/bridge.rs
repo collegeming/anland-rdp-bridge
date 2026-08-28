@@ -347,6 +347,7 @@ impl SessionRunner {
         let file_content_tx = self.file_content_tx.clone();
         let video_discontinuity = Arc::clone(&self.video_discontinuity);
         let connected = Arc::clone(&self.connected);
+        let pending_clipboard = Arc::clone(&self.pending_clipboard);
         let outbound = &mut self.outbound_rx;
         let mut shutdown = self.shutdown.resubscribe();
         loop {
@@ -367,6 +368,7 @@ impl SessionRunner {
                                 &file_list_tx,
                                 &file_content_tx,
                                 &video_discontinuity,
+                                &pending_clipboard,
                             )
                             .await
                             {
@@ -405,6 +407,7 @@ impl SessionRunner {
     /// outbound write arm. An associated function (not a method) so the session
     /// loop can pass cloned handles without a whole-`self` borrow that would
     /// conflict with the `&mut self.outbound_rx` field borrow.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_inbound(
         stream: &mut tokio::net::UnixStream,
         msg_type: u8,
@@ -415,6 +418,7 @@ impl SessionRunner {
         file_list_tx: &watch::Sender<Option<Vec<wire::FileEntry>>>,
         file_content_tx: &mpsc::Sender<wire::FileContentResponse>,
         video_discontinuity: &AtomicBool,
+        pending_clipboard: &Arc<Mutex<Option<(u64, String)>>>,
     ) -> bool {
         match msg_type {
             msg::VIDEO_FRAME => match VideoFramePayload::decode(data) {
@@ -506,9 +510,14 @@ impl SessionRunner {
             },
             msg::CLIPBOARD_ACK => {
                 if let Ok(seq) = wire::decode_clipboard_ack(data) {
-                    // TODO: surface to the CLIPRDR side via a channel so it
-                    // can release its pending-update latch. For now logged.
                     debug!("anland bridge: clipboard ack {seq}");
+                    if let Ok(mut g) = pending_clipboard.lock() {
+                        if let Some((s, _)) = &*g {
+                            if *s == seq {
+                                *g = None;
+                            }
+                        }
+                    }
                 }
                 true
             }
