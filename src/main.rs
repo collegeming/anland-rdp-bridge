@@ -2,6 +2,7 @@
 // is gone; this entry point drives the anland Linux RDP server (platform +
 // anland_bridge + server) once.
 
+#[cfg(test)]
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec, RemoteFxContainer};
 
 #[cfg(test)]

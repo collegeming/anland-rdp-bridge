@@ -1,3 +1,9 @@
+// Trait/struct fields declared by the platform contract but only exercised by
+// backends not yet wired (AAC encoding, VideoToolbox parameter sets, display-info
+// queries). They are part of the trait surface, not dead code — the anland-only
+// build just doesn't read them yet.
+#![allow(dead_code)]
+
 //! Platform abstraction layer between the RDP protocol logic and the
 //! capture / encode / input backends.
 //!

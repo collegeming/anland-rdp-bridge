@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Frame framing, message-type constants, and typed payload decode for the
 //! anland bridge protocol v1.
 //!
