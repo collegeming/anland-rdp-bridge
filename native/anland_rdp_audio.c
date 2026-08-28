@@ -202,9 +202,8 @@ static void on_reconnect_timer(void *data, uint64_t expirations)
     }
 }
 
-int anland_rdp_audio_start(const char *target_name)
+int anland_rdp_audio_start(void)
 {
-    (void)target_name;   /* reserved for routing; the virtual sink is self-contained */
     if (g)
         return 0;
 

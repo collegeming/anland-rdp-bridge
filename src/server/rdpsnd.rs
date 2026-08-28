@@ -25,7 +25,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
@@ -143,21 +142,14 @@ pub fn spawn_audio_pump(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
-        let mut poll = tokio::time::interval(Duration::from_millis(500));
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut paused = false;
-        // Bootstrap the capture backend once at pump start — the
-        // paused/resume path only calls start() on a transition, so without
-        // this the engine never boots on a quiet first session.
+        // Kick the capture shim once; the source is idempotent so later
+        // suppression/resume is a no-op (the shim keeps buffering and drops
+        // oldest on overflow — cheapest possible semantics for an RDP pipe).
         audio_source.start();
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
-                _ = poll.tick() => {
-                    update_audio_suppression(
-                        &mut audio_source, &display_suppressed, &mut paused,
-                    );
-                }
                 chunk = audio_source.next_chunk() => {
                     let chunk = match chunk {
                         Ok(Some(c)) => c,
@@ -168,11 +160,12 @@ pub fn spawn_audio_pump(
                         }
                     };
 
-                    update_audio_suppression(
-                        &mut audio_source, &display_suppressed, &mut paused,
-                    );
-                    if paused || display_suppressed.load(Ordering::Acquire) {
-                        continue; // muted while minimized
+                    // Suppression (client minimized) just mutes the outbound
+                    // channel — the source stays warm, niri/PipeWire keep
+                    // capturing, and the first frame after restore ships
+                    // immediately.
+                    if display_suppressed.load(Ordering::Acquire) {
+                        continue;
                     }
                     let wave = make_wave(&chunk);
                     let sender = match latest_audio_sender.lock() {
@@ -190,26 +183,6 @@ pub fn spawn_audio_pump(
         }
         info!("anland rdpsnd: audio pump stopped");
     });
-}
-
-/// Stop the Linux capture after display suppression; restart it on resume.
-fn update_audio_suppression(
-    audio_source: &mut Box<dyn AudioSource + Send>,
-    display_suppressed: &AtomicBool,
-    paused: &mut bool,
-) {    if display_suppressed.load(Ordering::Acquire) {
-        if !*paused {
-            audio_source.stop();
-            *paused = true;
-            debug!("anland rdpsnd: muted (display suppressed)");
-        }
-        return;
-    }
-    if *paused {
-        *paused = false;
-        audio_source.start();
-        debug!("anland rdpsnd: resumed (display restored)");
-    }
 }
 
 /// Convert an [`AudioChunk`] to an `AudioWave` for the RDPSND dispatch task.

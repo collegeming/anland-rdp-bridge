@@ -267,52 +267,81 @@ fn build_tls_acceptor(cert_path: &std::path::Path, key_path: &std::path::Path) -
     Ok(TlsAcceptor::from(Arc::new(server_cfg)))
 }
 
-/// Shared live-session display state: the current desktop geometry, a
-/// revision counter the EGFX pump watches to detect a client-driven resize,
-/// and a pending-resize latch the display `updates()` stream drains to drive
-/// the vendored server's Deactivation-Reactivation at the new size.
+/// Shared live-session display state: the current desktop geometry + the
+/// resize bookkeeping (revision bump + reactivation-echo suppression latch),
+/// guarded by a single mutex, plus a pending-resize `watch` the display
+/// `updates()` stream drains to drive the vendored server's
+/// Deactivation-Reactivation at the new size.
 pub(crate) struct AnlandDisplayState {
-    /// Current live geometry (the config size until the first client resize).
-    size: Arc<Mutex<DesktopSize>>,
-    /// Bumped once per accepted client resize; the EGFX video pump polls this
-    /// to reset the graphics pipeline at the new size.
-    revision: Arc<AtomicU64>,
+    inner: Mutex<DisplayStateInner>,
     /// Latest accepted resize, coalesced. The `updates()` stream drains it
     /// into a `DisplayUpdate::Resize` → the vendored server re-runs the core
     /// Deactivation-Reactivation with the new `DesktopSize`.
     pending_resize: watch::Sender<Option<DesktopSize>>,
+}
+
+struct DisplayStateInner {
+    /// Current live geometry (the config size until the first client resize).
+    size: DesktopSize,
+    /// Bumped once per accepted client resize; the EGFX video pump polls this
+    /// to reset the graphics pipeline at the new size.
+    revision: u64,
     /// Set by `request_layout` right before it drives a Deactivation-Reactivation;
     /// consumed by the next `request_initial_size` so that a reactivation WE
     /// triggered ourselves doesn't re-adopt the client's stale capset echo (which
     /// would immediately undo the resize we just applied — see the macOS
     /// `CaptureDisplay::suppress_next_adopt` rationale).
-    suppress_next_initial_adopt: AtomicBool,
+    suppress_next_initial_adopt: bool,
 }
 
 impl AnlandDisplayState {
     fn new(width: u16, height: u16) -> Self {
         let (pending_resize, _) = watch::channel(None);
         Self {
-            size: Arc::new(Mutex::new(DesktopSize { width, height })),
-            revision: Arc::new(AtomicU64::new(0)),
+            inner: Mutex::new(DisplayStateInner {
+                size: DesktopSize { width, height },
+                revision: 0,
+                suppress_next_initial_adopt: false,
+            }),
             pending_resize,
-            suppress_next_initial_adopt: AtomicBool::new(false),
         }
     }
 
     /// Current live geometry (config size until the first client resize).
     fn size(&self) -> DesktopSize {
-        *self.size.lock().expect("display size lock poisoned")
-    }
-
-    fn set_size(&self, width: u16, height: u16) {
-        *self.size.lock().expect("display size lock poisoned") = DesktopSize { width, height };
+        self.inner.lock().expect("display state lock poisoned").size
     }
 
     /// Monotonic resize counter; the EGFX pump compares against its last
     /// seen value to detect a change.
     fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+        self.inner.lock().expect("display state lock poisoned").revision
+    }
+
+    /// Adopt a new geometry and bump the revision (one state transition for
+    /// the size + counter pair, so the pump's compare can never tear them).
+    fn apply_resize(&self, width: u16, height: u16) {
+        let mut g = self.inner.lock().expect("display state lock poisoned");
+        g.size = DesktopSize { width, height };
+        g.revision += 1;
+    }
+
+    /// True exactly once after `arm_reactivation_echo_suppress`.
+    fn take_reactivation_echo_suppress(&self) -> bool {
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .expect("display state lock poisoned")
+                .suppress_next_initial_adopt,
+        )
+    }
+
+    fn arm_reactivation_echo_suppress(&self) {
+        self.inner
+            .lock()
+            .expect("display state lock poisoned")
+            .suppress_next_initial_adopt = true;
     }
 }
 
@@ -378,7 +407,7 @@ impl RdpServerDisplay for AnlandDisplay {
         // original connect-time size), so blindly re-adopting it would undo
         // the resize. Skip adoption exactly once when `request_layout` armed
         // this reactivation.
-        if self.state.suppress_next_initial_adopt.swap(false, Ordering::AcqRel) {
+        if self.state.take_reactivation_echo_suppress() {
             let cur = self.state.size();
             debug!(
                 width = cur.width,
@@ -417,9 +446,7 @@ impl RdpServerDisplay for AnlandDisplay {
         self.apply_resize(width, height);
         // The resize drives a Deactivation-Reactivation; suppress the echo so
         // `request_initial_size` doesn't re-adopt the stale client size.
-        self.state
-            .suppress_next_initial_adopt
-            .store(true, Ordering::Release);
+        self.state.arm_reactivation_echo_suppress();
         // Queue the Deactivation-Reactivation so mstsc re-negotiates the
         // desktop size — what real RDS servers send on an MS-RDPEDISP
         // resize (a bare EGFX surface swap without it was visually broken).
@@ -449,8 +476,7 @@ impl AnlandDisplay {
     /// `STREAM_START` is the bridge's resize signal — the consumer rebuilds
     /// its route, and ANiri `adapt_to_size` re-modes the virtual display.
     fn apply_resize(&self, width: u16, height: u16) {
-        self.state.set_size(width, height);
-        self.state.revision.fetch_add(1, Ordering::Release);
+        self.state.apply_resize(width, height);
         self.bridge.start_stream(width, height, self.fps);
     }
 
