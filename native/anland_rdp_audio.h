@@ -23,10 +23,8 @@ extern "C" {
 #endif
 
 /* Start the PipeWire virtual sink "anland-rdp-speaker" (and its capture path).
- * `target_name` is currently unused (reserved for routing the virtual sink
- * through an existing node); pass NULL. Returns 0 on success, -1 on failure.
- * Idempotent: a no-op if already started. */
-int anland_rdp_audio_start(const char *target_name);
+ * Returns 0 on success, -1 on failure. Idempotent: a no-op if already started. */
+int anland_rdp_audio_start(void);
 
 /* Pull captured S16LE interleaved PCM into `buf` (up to `max_bytes`).
  * On success returns the byte count written (0 when the ring is empty).

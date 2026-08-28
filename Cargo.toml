@@ -19,19 +19,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
-thiserror = "1"
-clap = { version = "4", features = ["derive"] }
-async-trait = "0.1"
-bytes = "1"
-rpassword = "7"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
-zeroize = "1"
-rubato = "0.16"  # 48 kHz SCK capture -> 44.1 kHz output, advertised to client
+bytes = "1"
 
-# HMAC-SHA256 mutual auth for the private anland Unix-socket bridge.
-# Versions matched to the proven ironrdp/rustls stack (rustls 0.23 / aws-lc-rs
-# pulls sha2 transitively but not the hmac facade).
+# Bridge to the anland consumer side (Android fork). Retained because the
+# current release asset is pinned and the contract is shared.
 hmac = "0.13"
 sha2 = "0.11"
 
@@ -40,8 +33,6 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rcgen = "0.13"  # self-signed cert for first-run / dev
 rustls-pemfile = "2"  # read persisted cert.pem / key.pem on subsequent runs
-x509-cert = { version = "0.2", default-features = false }
-der = "0.7"
 
 # RDP protocol — ironrdp is split into many sub-crates; add only what you use.
 ironrdp = "0.17"
@@ -53,17 +44,11 @@ ironrdp-pdu = "0.9"
 # wired up unconditionally inside vendor/ironrdp-server; this just gets us the PDU
 # accessors (DisplayControlMonitorLayout::monitors()).
 ironrdp-displaycontrol = "0.8"
-# CSPRNG for the Server Auto-Reconnect Cookie random bits (already in the tree
-# via rustls/aws-lc-rs); a direct dep so the base build doesn't rely on the
-# multitransport feature for it.
+# CSPRNG for the Server Auto-Reconnect Cookie random bits / HMAC tokens.
 getrandom = "0.2"
 ironrdp-cliprdr = "0.7"
 ironrdp-core = "0.2"
 ironrdp-rdpsnd = "0.9"
-# RDPDR drive redirection (gated at runtime by --enable-drive-redirection).
-# Vendored locally for the server-direction encode/decode halves — see
-# vendor/ironrdp-rdpdr/CLAUDE.md.
-ironrdp-rdpdr = "0.7"
 # EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
 ironrdp-egfx = "0.3"
 ironrdp-dvc = "0.8"
@@ -83,22 +68,10 @@ tempfile = "3"
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 
 [build-dependencies]
-# Compile the USB-redirection Obj-C shim (src/usb_redirect/usb_spike.m) on macOS.
+# Compile the PipeWire audio-shim (native/anland_rdp_audio.c) on Linux.
 cc = "1"
 
-# macOS-only: screen capture + input synthesis
-[target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = { version = "0.24", features = ["highsierra"] }
-core-foundation = "0.10"
-# ScreenCaptureKit bindings — verify the crate name/version against crates.io;
-# alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
-objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSBundle", "NSError", "NSDictionary", "NSNotification", "NSFileCoordinator", "NSFilePresenter", "NSOperation", "block2"] }
-block2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "libc"] }
-screencapturekit = { version = "2.1", features = ["async"] }
-
-# All ironrdp-* crates pinned to a specific upstream commit. The published
+[patch.crates-io]
 # 0.x crates lag main by enough that several features we need (file
 # clipboard via SendFileContents{Request,Response}, the EGFX virtual channel
 # for AVC/H.264, etc.) only exist on `master`. The pinned commit is bumped
@@ -117,10 +90,6 @@ ironrdp-server = { path = "vendor/ironrdp-server" }
 # the honor-client-desktop-size divergence — serve the resolution the client
 # requests. See vendor/ironrdp-acceptor/CLAUDE.md.
 ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
-# ironrdp-rdpdr is vendored (same upstream rev) for the server-direction RDPDR
-# encode/decode halves the client-oriented upstream crate lacks. See
-# vendor/ironrdp-rdpdr/CLAUDE.md.
-ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # ironrdp-dvc is vendored (same upstream rev) for server-side MS-RDPEDYC Soft-Sync
 # support — moving dynamic virtual channels (EGFX) onto the UDP multitransport
 # tunnel. Upstream is client-oriented and errors on the server-inbound
@@ -142,6 +111,8 @@ ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git",
 # rest so it unifies with the copy the other ironrdp crates pull transitively.
 ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-adapter            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
@@ -168,3 +139,4 @@ ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+

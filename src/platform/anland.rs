@@ -228,7 +228,7 @@ pub struct AnlandAudioSource {
 }
 
 extern "C" {
-    fn anland_rdp_audio_start(target: *const std::os::raw::c_char) -> std::os::raw::c_int;
+    fn anland_rdp_audio_start() -> std::os::raw::c_int;
     fn anland_rdp_audio_pull(
         buf: *mut std::ffi::c_void,
         max_bytes: u32,
@@ -321,7 +321,7 @@ impl AudioSource for AnlandAudioSource {
         if !self.started.swap(true, Ordering::SeqCst) {
             // SAFETY: no-op if already started; first call bootstraps the
             // PipeWire thread loop + virtual sink.
-            let rc = unsafe { anland_rdp_audio_start(std::ptr::null()) };
+            let rc = unsafe { anland_rdp_audio_start() };
             if rc != 0 {
                 // Clear so a later start() retries; the pump will keep pulling
                 // and bail on the shim's "not started" error.
