@@ -281,6 +281,12 @@ pub(crate) struct AnlandDisplayState {
     /// into a `DisplayUpdate::Resize` → the vendored server re-runs the core
     /// Deactivation-Reactivation with the new `DesktopSize`.
     pending_resize: watch::Sender<Option<DesktopSize>>,
+    /// Set by `request_layout` right before it drives a Deactivation-Reactivation;
+    /// consumed by the next `request_initial_size` so that a reactivation WE
+    /// triggered ourselves doesn't re-adopt the client's stale capset echo (which
+    /// would immediately undo the resize we just applied — see the macOS
+    /// `CaptureDisplay::suppress_next_adopt` rationale).
+    suppress_next_initial_adopt: AtomicBool,
 }
 
 impl AnlandDisplayState {
@@ -290,6 +296,7 @@ impl AnlandDisplayState {
             size: Arc::new(Mutex::new(DesktopSize { width, height })),
             revision: Arc::new(AtomicU64::new(0)),
             pending_resize,
+            suppress_next_initial_adopt: AtomicBool::new(false),
         }
     }
 
@@ -362,6 +369,27 @@ impl RdpServerDisplay for AnlandDisplay {
         }))
     }
 
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        // This fires once at connect (mstsc fullscreen/maximize sends its
+        // desktop width/height in Confirm Active) AND again on every
+        // Deactivation-Reactivation — including one WE just triggered for a
+        // mid-session `request_layout` resize. During that self-triggered
+        // reactivation the client echoes a stale capset size (often its
+        // original connect-time size), so blindly re-adopting it would undo
+        // the resize. Skip adoption exactly once when `request_layout` armed
+        // this reactivation.
+        if self.state.suppress_next_initial_adopt.swap(false, Ordering::AcqRel) {
+            let cur = self.state.size();
+            debug!(
+                width = cur.width,
+                height = cur.height,
+                "anland display: self-triggered reactivation — keeping server-driven size"
+            );
+            return cur;
+        }
+        self.adopt_client_size(client_size)
+    }
+
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         // Pick the primary monitor's requested dimensions (same shape as the
         // macOS CaptureDisplay path).
@@ -375,31 +403,26 @@ impl RdpServerDisplay for AnlandDisplay {
             return;
         };
         let (w, h) = monitor.dimensions();
-        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
+        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
             warn!(w, h, "anland display: client-requested monitor size out of range — ignoring");
             return;
         };
-        // Clamp to the protocol-legal / config band. The Android encoder
-        // rejects <64px surfaces; niri modes top out at 4096x2160 by default.
-        const MIN_DIM: u16 = 320;
-        width = width.clamp(MIN_DIM, self.max_width);
-        height = height.clamp(MIN_DIM, self.max_height);
+        let (width, height) = self.clamp(width, height);
 
         let cur = self.state.size();
         if (width, height) == (cur.width, cur.height) {
             return; // unchanged — no churn
         }
 
-        // 1. Publish the new geometry: `size()` (used by the reactivation's
-        //    Demand Active) and the EGFX pump both read the shared state.
-        self.state.set_size(width, height);
-        self.state.revision.fetch_add(1, Ordering::Release);
-        // 2. Reconfigure the Android encoder at the new size. STREAM_START is
-        //    the bridge's resize signal; the consumer rebuilds its route.
-        self.bridge.start_stream(width, height, self.fps);
-        // 3. Queue the Deactivation-Reactivation so mstsc re-negotiates the
-        //    desktop size — what real RDS servers send on an MS-RDPEDISP
-        //    resize (a bare EGFX surface swap without it was visually broken).
+        self.apply_resize(width, height);
+        // The resize drives a Deactivation-Reactivation; suppress the echo so
+        // `request_initial_size` doesn't re-adopt the stale client size.
+        self.state
+            .suppress_next_initial_adopt
+            .store(true, Ordering::Release);
+        // Queue the Deactivation-Reactivation so mstsc re-negotiates the
+        // desktop size — what real RDS servers send on an MS-RDPEDISP
+        // resize (a bare EGFX surface swap without it was visually broken).
         let _ = self
             .state
             .pending_resize
@@ -409,6 +432,47 @@ impl RdpServerDisplay for AnlandDisplay {
             height,
             "anland display: client resize accepted — reconfiguring encoder + graphics pipeline"
         );
+    }
+}
+
+impl AnlandDisplay {
+    /// Clamp a client-requested size to the protocol-legal / config band. The
+    /// Android encoder rejects <64px surfaces; niri modes top out at
+    /// 4096x2160 by default (`ANLAND_MAX_WIDTH`/`ANLAND_MAX_HEIGHT`).
+    fn clamp(&self, width: u16, height: u16) -> (u16, u16) {
+        const MIN_DIM: u16 = 320;
+        (width.clamp(MIN_DIM, self.max_width), height.clamp(MIN_DIM, self.max_height))
+    }
+
+    /// Publish a new geometry and reconfigure the Android encoder at that size
+    /// (shared by the connect-time initial size and the mid-session resize).
+    /// `STREAM_START` is the bridge's resize signal — the consumer rebuilds
+    /// its route, and ANiri `adapt_to_size` re-modes the virtual display.
+    fn apply_resize(&self, width: u16, height: u16) {
+        self.state.set_size(width, height);
+        self.state.revision.fetch_add(1, Ordering::Release);
+        self.bridge.start_stream(width, height, self.fps);
+    }
+
+    /// Adopt the client's connect-time desktop size (clamped), returning the
+    /// negotiated size. mstsc reports its window/fullscreen size here; serving
+    /// it directly means the session starts at the client's resolution without
+    /// a resize round-trip (the lamco 0.2.3 fix).
+    fn adopt_client_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let (width, height) = self.clamp(client_size.width, client_size.height);
+        let cur = self.state.size();
+        if (width, height) == (cur.width, cur.height) {
+            return cur;
+        }
+        info!(
+            client_w = client_size.width,
+            client_h = client_size.height,
+            width,
+            height,
+            "anland display: serving client-requested desktop resolution"
+        );
+        self.apply_resize(width, height);
+        DesktopSize { width, height }
     }
 }
 
