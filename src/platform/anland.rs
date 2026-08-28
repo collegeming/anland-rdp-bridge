@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! anland / Linux / Android platform backends.
 //!
 //! These backends source frames/audio/clipboard/input from Android

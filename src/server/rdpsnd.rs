@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! RDPSND audio: forwards the **Linux desktop** audio (niri/anland playback,
 //! captured on the Linux side via the platform [`AudioSource`]) to `mstsc`.
 //!

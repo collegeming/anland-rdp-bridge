@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
+async-trait = "0.1"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 bytes = "1"
@@ -71,10 +72,10 @@ ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 # Compile the PipeWire audio-shim (native/anland_rdp_audio.c) on Linux.
 cc = "1"
 
-[patch.crates-io]
-# 0.x crates lag main by enough that several features we need (file
-# clipboard via SendFileContents{Request,Response}, the EGFX virtual channel
-# for AVC/H.264, etc.) only exist on `master`. The pinned commit is bumped
+# All ironrdp-* crates pinned to a specific upstream commit. The published
+# 0.x crates lag main by enough that several features we need (file clipboard
+# via SendFileContents{Request,Response}, the EGFX virtual channel for
+# AVC/H.264, etc.) only exist on `master`. The pinned commit is bumped
 # manually so the build is reproducible.
 #
 # `ironrdp-server` is the one exception — it stays vendored locally because
@@ -95,6 +96,12 @@ ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 # tunnel. Upstream is client-oriented and errors on the server-inbound
 # SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+# ironrdp-rdpdr is vendored (same upstream rev) for the server-direction RDPDR
+# encode/decode halves the client-oriented upstream crate lacks. The vendored
+# ironrdp-server pulls `ironrdp-rdpdr = "0.7"` and needs THIS path patch to
+# resolve to the server-direction copy (crates.io 0.7 is client-only). See
+# vendor/ironrdp-rdpdr/CLAUDE.md.
+ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # ironrdp-rdpeusb: FORK RETIRED at the a5d1c682 pin bump — all four vendored
 # divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
 # #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
@@ -111,8 +118,6 @@ ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git",
 # rest so it unifies with the copy the other ironrdp crates pull transitively.
 ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-adapter            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }

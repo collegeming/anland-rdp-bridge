@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! EGFX AVC420 video pump: pulls already-encoded H.264 frames from the anland
 //! bridge (via the platform [`VideoFrameSource`]) and ships them to `mstsc`
 //! over the RDP EGFX graphics pipeline.
@@ -124,7 +125,11 @@ impl GraphicsPipelineHandler for AnlandGraphicsHandler {
     }
 
     fn on_close(&mut self) {
-        self.bridge.stop_stream();
+        // Do NOT call bridge.stop_stream() here: that clears the persistent
+        // `desired_stream`, and the video pump (which re-sends STREAM_START on
+        // resume) would then leave the Android encoder stopped forever after
+        // reconnect. Stream start/stop is the suppression path's job; a closed
+        // EGFX channel just means this RDP connection stops receiving frames.
         self.state.reset();
         info!("anland gfx: EGFX channel closed");
     }
@@ -247,7 +252,7 @@ pub fn spawn_video_pump(
                 _ = shutdown_rx.recv() => break,
                 _ = poll.tick() => {
                     update_suppression(
-                        &bridge, &state, &display_suppressed,
+                        &source, &bridge, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
@@ -271,7 +276,7 @@ pub fn spawn_video_pump(
                     };
 
                     update_suppression(
-                        &bridge, &state, &display_suppressed,
+                        &source, &bridge, &state, &display_suppressed,
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
@@ -357,9 +362,13 @@ pub fn spawn_video_pump(
 }
 
 /// Update the stream-suppression state from `display_suppressed` and drive the
-/// Android encoder start/stop accordingly.
+/// Android encoder start/stop accordingly. Restarting is done via
+/// [`VideoFrameSource::start`] — `bridge.stop_stream()` clears the persisted
+/// `desired_stream`, so a resume must re-send STREAM_START, and only the source
+/// holds the width/height/fps needed to do it.
 #[allow(clippy::fn_params_excessive_bools)]
 fn update_suppression(
+    source: &Box<dyn VideoFrameSource + Send>,
     bridge: &AnlandBridge,
     state: &GraphicsState,
     display_suppressed: &Arc<AtomicBool>,
@@ -385,8 +394,11 @@ fn update_suppression(
         *stream_paused = false;
         *awaiting_idr = true;
         if state.ready.load(Ordering::Acquire) && state.supports_avc420.load(Ordering::Acquire) {
-            bridge.request_idr();
-            info!("anland gfx: display resumed; requested IDR");
+            // `bridge.stop_stream()` cleared `desired_stream`, so a bare IDR
+            // would leave the Android encoder stopped forever — the source's
+            // `start()` re-sends STREAM_START at its own geometry/fps.
+            source.start();
+            info!("anland gfx: display resumed; restarted Android encoder + requested IDR");
         }
     } else if was_suppressed {
         *awaiting_idr = true;

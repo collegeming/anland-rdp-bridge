@@ -1,3 +1,8 @@
+// OutboundCmd variants / bridge fields / methods that are part of the wire
+// contract or reserved for future wiring (ClipboardAck, is_connected,
+// ack_clipboard) — not dead code, just not yet called on the anland-only path.
+#![allow(dead_code)]
+
 //! Anland bridge orchestrator.
 //!
 //! Ties together the hardened [`transport`] listener, the HMAC [`auth`]
@@ -342,7 +347,7 @@ impl SessionRunner {
         let file_content_tx = self.file_content_tx.clone();
         let video_discontinuity = Arc::clone(&self.video_discontinuity);
         let connected = Arc::clone(&self.connected);
-        let mut outbound = &mut self.outbound_rx;
+        let outbound = &mut self.outbound_rx;
         let mut shutdown = self.shutdown.resubscribe();
         loop {
             tokio::select! {

@@ -39,7 +39,7 @@ pub mod rdpsnd;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -49,7 +49,7 @@ use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use rustls::ServerConfig;
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
@@ -619,13 +619,13 @@ mod tests {
             (1280, 720),
             "initial geometry is the config size"
         );
-        state.set_size(2560, 1600);
+        state.apply_resize(2560, 1600);
         assert_eq!(
             (state.size().width, state.size().height),
             (2560, 1600),
-            "set_size updates the live geometry"
+            "apply_resize updates the live geometry"
         );
-        assert_eq!(state.revision(), 0, "set_size is not a client resize");
+        assert_eq!(state.revision(), 1, "apply_resize bumps the resize revision");
     }
 
     /// The updates stream must yield exactly one `Resize` per accepted request,
