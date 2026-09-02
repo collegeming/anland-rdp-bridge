@@ -255,6 +255,10 @@ pub fn spawn_video_pump(
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
+                        // Drop stale frames buffered from the dead session
+                        // BEFORE re-arming the IDR gate, so an old keyframe
+                        // can not satisfy it and poison the new session.
+                        source.drain();
                         enter_discontinuity(&*source, &mut awaiting_idr);
                     }
                     if let Err(e) = check_resize(
@@ -279,6 +283,10 @@ pub fn spawn_video_pump(
                         &mut suppression_started, &mut stream_paused, &mut awaiting_idr,
                     );
                     if bridge_discontinuity.swap(false, Ordering::AcqRel) {
+                        // Drop stale frames buffered from the dead session
+                        // BEFORE re-arming the IDR gate, so an old keyframe
+                        // can not satisfy it and poison the new session.
+                        source.drain();
                         enter_discontinuity(&*source, &mut awaiting_idr);
                     }
                     if stream_paused || display_suppressed.load(Ordering::Acquire) {

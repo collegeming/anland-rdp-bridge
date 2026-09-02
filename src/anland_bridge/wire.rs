@@ -20,8 +20,9 @@ pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Message type identifiers.
 ///
-/// Application messages are 1–19; authentication messages are 32–35. No
-/// application message is accepted before `AUTH_OK` completes.
+/// Application messages are 1–19 plus the file-clipboard trio 23–25;
+/// authentication messages are 32–35. No application message is accepted
+/// before `AUTH_OK` completes.
 pub mod msg {
     // Application messages.
     pub const KEY: u8 = 1;
@@ -216,7 +217,7 @@ pub fn decode_clipboard_ack(payload: &[u8]) -> Result<u64> {
     Ok(sequence)
 }
 
-/// A decoded `CLIPBOARD_IMAGE` (message type 7) payload: a non-zero `u64`
+/// A decoded `CLIPBOARD_IMAGE` (message type 8) payload: a non-zero `u64`
 /// sequence plus PNG-encoded image bytes (non-empty).
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {

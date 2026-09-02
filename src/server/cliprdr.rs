@@ -418,6 +418,13 @@ fn decode_utf16(bytes: &[u8]) -> String {    let mut units = Vec::with_capacity(
 /// by 32bpp BGRA pixels, top-down (negative biHeight). 32bpp is the most
 /// widely supported variant; BITMAPV5HEADER is deliberately not emitted since
 /// it complicates color-space negotiation with older clients.
+/// Clipboard images above this many pixels are rejected on both conversion
+/// paths. The 16 MiB wire limit only bounds the *compressed* payload; an
+/// uncompressed bitmap of e.g. 60000×60000 would otherwise allocate ~14 GB of
+/// RGBA from a few MB of PNG (decompression bomb). 16.7 MP covers 4K with
+/// headroom.
+const MAX_CLIP_PIXELS: u64 = 16 * 1024 * 1024;
+
 fn png_to_dib(png: &[u8]) -> Result<Vec<u8>> {
     let img = ImageReader::new(Cursor::new(png))
         .with_guessed_format()
@@ -426,6 +433,13 @@ fn png_to_dib(png: &[u8]) -> Result<Vec<u8>> {
         .context("decode PNG")?
         .to_rgba8();
     let (w, h) = (img.width(), img.height());
+    anyhow::ensure!(
+        u64::from(w) * u64::from(h) <= MAX_CLIP_PIXELS,
+        "PNG expands to {}x{} pixels, above the {} pixel clipboard limit",
+        w,
+        h,
+        MAX_CLIP_PIXELS
+    );
     let row_bytes = (w as usize) * 4;
     let pixel_bytes = row_bytes * (h as usize);
 
@@ -487,6 +501,15 @@ fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
 
     let w = width as u32;
     let h = height_signed.unsigned_abs();
+    // Resource cap before any allocation — a client-controlled header must not
+    // be able to request a multi-gigabyte RGBA buffer (see MAX_CLIP_PIXELS).
+    anyhow::ensure!(
+        u64::from(w) * u64::from(h) <= MAX_CLIP_PIXELS,
+        "DIB is {}x{} pixels, above the {} pixel clipboard limit",
+        w,
+        h,
+        MAX_CLIP_PIXELS
+    );
     let top_down = height_signed < 0;
     let bpp = (bit_count / 8) as usize;
     // BMP rows are padded to a 4-byte multiple.

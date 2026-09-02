@@ -397,7 +397,13 @@ impl SessionRunner {
         // Reset for the next client.
         connected.store(false, Ordering::Release);
         self.video_discontinuity.store(true, Ordering::Release);
-        info!("anland bridge: client disconnected; returning to accept");
+        // Drain stale outbound commands (input/IDR/stream) accumulated while
+        // disconnected — replaying them to the next Android session would send
+        // stale input. Stale inbound video frames are drained by the video
+        // pump itself (see VideoFrameSource::drain) when it observes the
+        // discontinuity flag set here.
+        while self.outbound_rx.try_recv().is_ok() {}
+        info!("anland bridge: client disconnected; outbound drained; returning to accept");
     }
 
     /// Route one inbound application frame to the right channel. Returns
@@ -423,9 +429,24 @@ impl SessionRunner {
         match msg_type {
             msg::VIDEO_FRAME => match VideoFramePayload::decode(data) {
                 Ok(frame) => {
-                    if video_tx.send(frame).await.is_err() {
-                        // RDP side gone; the ship loop will notice.
-                        debug!("anland bridge: video channel closed");
+                    // Never block the bridge session loop on a slow RDP
+                    // consumer: if the bounded video queue is full, drop THIS
+                    // frame and flag a discontinuity — the EGFX pump then
+                    // drops P-frames until a fresh keyframe re-syncs the
+                    // prediction chain. Blocking here would stall clipboard,
+                    // file responses, and control traffic behind one video
+                    // frame (head-of-line blocking).
+                    if let Err(e) = video_tx.try_send(frame) {
+                        match e {
+                            mpsc::error::TrySendError::Full(_) => {
+                                debug!("anland bridge: video queue full; dropping frame + discontinuity");
+                                video_discontinuity.store(true, Ordering::Release);
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                // RDP side gone; the ship loop will notice.
+                                debug!("anland bridge: video channel closed");
+                            }
+                        }
                     }
                     true
                 }
@@ -498,8 +519,12 @@ impl SessionRunner {
             },
             msg::FILE_CONTENT_RESPONSE => match wire::FileContentResponse::decode(data) {
                 Ok(resp) => {
-                    if file_content_tx.send(resp).await.is_err() {
-                        debug!("anland bridge: file content channel closed");
+                    // Never block the bridge session loop on a slow CLIPRDR
+                    // file consumer — the pending request times out on its own
+                    // (5s), so a dropped response is recoverable, while a
+                    // blocked read loop would stall the whole Android session.
+                    if let Err(e) = file_content_tx.try_send(resp) {
+                        debug!("anland bridge: file content channel unavailable ({e}); response dropped");
                     }
                     true
                 }

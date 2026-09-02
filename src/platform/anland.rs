@@ -207,6 +207,12 @@ impl VideoFrameSource for AnlandVideoSource {
     fn stop(&self) {
         self.bridge.stop_stream();
     }
+
+    fn drain(&mut self) {
+        // Drop every buffered frame from the dead session; the next frame the
+        // bridge delivers belongs to the new one.
+        while self.rx.try_recv().is_ok() {}
+    }
 }
 
 /// PipeWire desktop-audio source. Drains S16LE PCM (44.1 kHz / stereo) from

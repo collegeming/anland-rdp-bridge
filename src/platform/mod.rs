@@ -101,6 +101,12 @@ pub trait VideoFrameSource: Send {
     /// (client minimized via SuppressOutput) or the channel closed, so the
     /// upstream encoder drains naturally rather than backpressuring.
     fn stop(&self);
+
+    /// Drop every buffered frame. Called when the bridge signals a
+    /// discontinuity (Android reconnect) so stale frames from the dead
+    /// session — including an old keyframe that would otherwise satisfy the
+    /// pump's awaiting_idr gate — never reach the new session's surface.
+    fn drain(&mut self) {}
 }
 
 /// A chunk of audio ready to ship over the RDPSND channel.
