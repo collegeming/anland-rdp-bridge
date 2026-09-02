@@ -87,27 +87,50 @@ mod anland_entry {
         Ok((cert_path, key_path))
     }
 
-    /// 32-hex token → 16 bytes. Unset → generate one and print it so the
-    /// operator can mirror it to the Android consumer.
+    /// Bridge token, 16 bytes. Resolution order: `ANLAND_BRIDGE_TOKEN` env →
+    /// previously persisted `bridge.token` (so a restart reuses the token the
+    /// Android side already knows) → freshly generated (printed once for the
+    /// operator to mirror to the Android consumer). Generation failure to
+    /// persist is a hard error, not a warning — silently rotating the token
+    /// would leave Android permanently failing auth with no diagnostics.
     fn ensure_bridge_token() -> Result<Vec<u8>> {
-        if let Ok(hex) = std::env::var("ANLAND_BRIDGE_TOKEN") {
+        fn parse_hex(hex: &str) -> Result<Vec<u8>> {
             let hex = hex.trim().to_ascii_lowercase();
             anyhow::ensure!(
                 hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()),
-                "ANLAND_BRIDGE_TOKEN must be 32 lowercase hex chars"
+                "bridge token must be 32 hex chars"
             );
             let mut bytes = Vec::with_capacity(16);
             for i in (0..hex.len()).step_by(2) {
                 bytes.push(u8::from_str_radix(&hex[i..i + 2], 16)?);
             }
-            return Ok(bytes);
+            Ok(bytes)
         }
+
+        if let Ok(hex) = std::env::var("ANLAND_BRIDGE_TOKEN") {
+            return parse_hex(&hex)
+                .with_context(|| "ANLAND_BRIDGE_TOKEN invalid".to_string());
+        }
+
+        let dir = default_cert_dir()?;
+        let token_path = dir.join("bridge.token");
+        if let Ok(persisted) = std::fs::read_to_string(&token_path) {
+            match parse_hex(&persisted) {
+                Ok(bytes) => {
+                    info!(token = %token_path.display(), "reusing persisted bridge token");
+                    return Ok(bytes);
+                }
+                Err(e) => warn!("persisted bridge token invalid ({e}); regenerating"),
+            }
+        }
+
         let mut buf = [0u8; 16];
         getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("token RNG: {e}"))?;
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-        let dir = default_cert_dir()?;
-        std::fs::create_dir_all(&dir).ok();
-        let _ = std::fs::write(dir.join("bridge.token"), &hex);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create data dir {}", dir.display()))?;
+        std::fs::write(&token_path, &hex)
+            .with_context(|| format!("persist bridge token to {}", token_path.display()))?;
         warn!("generated new bridge token (16 bytes): {hex}");
         warn!("mirror this token to the Android anland consumer");
         Ok(buf.to_vec())
@@ -141,7 +164,9 @@ mod anland_entry {
             .parse()
             .context("ANLAND_FPS")?;
         // Upper bound for a client-requested MS-RDPEDISP resize (niri modes top
-        // out at 4096x2160 by default).
+        // out at 4096x2160 by default). Validated here so the display handler's
+        // `clamp(320, max)` can never see min > max and panic mid-session.
+        const MIN_DIM: u16 = 320;
         let max_width: u16 = std::env::var("ANLAND_MAX_WIDTH")
             .unwrap_or_else(|_| "4096".into())
             .parse()
@@ -150,6 +175,10 @@ mod anland_entry {
             .unwrap_or_else(|_| "2160".into())
             .parse()
             .context("ANLAND_MAX_HEIGHT")?;
+        anyhow::ensure!(
+            max_width >= MIN_DIM && max_height >= MIN_DIM,
+            "ANLAND_MAX_WIDTH/HEIGHT must be >= {MIN_DIM} (got {max_width}x{max_height})"
+        );
 
         let (cert_path, key_path) = ensure_cert()?;
         let bridge_token = ensure_bridge_token()?;
